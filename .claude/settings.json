@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "teammateMode": "tmux",
+  "permissions": {
+    "allow": [
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git branch*)",
+      "Bash(ls*)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(ruff check*)",
+      "Bash(ruff format*)",
+      "Bash(pytest*)",
+      "Bash(python -m pytest*)",
+      "Bash(.venv/bin/pytest*)",
+      "Bash(.venv/bin/ruff*)",
+      "Bash(npm run lint*)",
+      "Bash(npm run build*)",
+      "Bash(npx tsc --noEmit*)",
+      "Bash(npm --prefix frontend run lint*)",
+      "Bash(npm --prefix frontend run build*)"
+    ],
+    "deny": [
+      "Read(./backend/.env)",
+      "Read(./frontend/.env.local)",
+      "Read(./.env)"
+    ]
+  }
+}

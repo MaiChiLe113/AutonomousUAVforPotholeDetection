@@ -1,26 +1,29 @@
-import type { Metadata } from "next";
-import Link from "next/link";
-
+import "leaflet/dist/leaflet.css";
 import "./globals.css";
 
+import type { Metadata, Viewport } from "next";
+
+import AppShell from "@/components/AppShell";
+import { APP } from "@/lib/config";
+
 export const metadata: Metadata = {
-  title: "Pothole UAV",
-  description: "Report potholes and follow UAV confirmation",
+  title: APP.name,
+  description: APP.description,
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: "#ffffff",
+  colorScheme: "light",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body className="min-h-screen antialiased">
-        <nav className="flex gap-6 border-b bg-white px-4 py-3 text-sm font-medium">
-          <Link href="/" className="font-semibold">
-            Pothole UAV
-          </Link>
-          <Link href="/report">Report a pothole</Link>
-          <Link href="/monitor">Monitor</Link>
-          <Link href="/monitor/dashboard">Dashboard</Link>
-        </nav>
-        <main className="mx-auto max-w-5xl p-4">{children}</main>
+      <body className="antialiased">
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   );

@@ -1,21 +1,47 @@
 "use client";
 
-// SCRUM-39 (Chi): live UAV position, mission state and target pothole on one map.
-import dynamic from "next/dynamic";
+// SCRUM-39 live UAV dashboard. /monitor/dashboard?mission=ID follows one mission (UC-M4, UC-M5);
+// without ?mission it lists the active missions. useSearchParams needs the <Suspense> boundary for `next build`.
 
-import Todo from "@/components/Todo";
+import { useSearchParams } from "next/navigation";
+import { Suspense } from "react";
 
-const MapView = dynamic(() => import("@/components/MapView"), { ssr: false });
+import ActiveMissions from "@/components/monitor/ActiveMissions";
+import MissionDashboard from "@/components/monitor/MissionDashboard";
+import RoleGate from "@/components/RoleGate";
+import { ButtonLink, EmptyState, FloatingPanel, LoadingState } from "@/components/ui";
+import { MONITOR_ROUTES } from "@/lib/config";
 
 export default function DashboardPage() {
   return (
-    <div className="space-y-4">
-      <h1 className="text-xl font-semibold">UAV dashboard</h1>
-      <MapView className="h-[32rem] w-full rounded" />
-      <Todo task="SCRUM-39, Chi">
-        listMissions(true), then poll latestTelemetry(missionId) every POLL_INTERVAL_MS.telemetry; show the UAV marker,
-        state (takeoff / surveying / landing) and the target pin; show confirmed / not confirmed when done.
-      </Todo>
-    </div>
+    <RoleGate role="monitor">
+      <Suspense fallback={<LoadingState className="absolute inset-0" />}>
+        <Dashboard />
+      </Suspense>
+    </RoleGate>
   );
+}
+
+function Dashboard() {
+  const raw = useSearchParams().get("mission");
+  if (raw === null || raw === "") return <ActiveMissions />;
+
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id <= 0) {
+    return (
+      <FloatingPanel backHref={MONITOR_ROUTES.dashboard()} title="Live dashboard">
+        <EmptyState
+          title="Mission not found"
+          description={`"${raw}" is not a mission id.`}
+          action={
+            <ButtonLink href={MONITOR_ROUTES.dashboard()} variant="secondary">
+              Show active missions
+            </ButtonLink>
+          }
+        />
+      </FloatingPanel>
+    );
+  }
+  // key: a new mission id starts with fresh state (telemetry, trail, camera).
+  return <MissionDashboard key={id} missionId={id} />;
 }

@@ -34,4 +34,8 @@ next-env.d.ts
 .idea/
 .vscode/
 
-.claude
+# Claude Code: share project settings + agent roles, keep personal/local files out
+.claude/*
+!.claude/settings.json
+!.claude/agents/
+!.claude/launch.json

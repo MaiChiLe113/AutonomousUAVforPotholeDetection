@@ -210,6 +210,49 @@ class ApiConfig:
     allowed_types: tuple[str, ...] = ("image/jpeg", "image/png")
 
 
+# ---------------------------------------------------------------------------
+# Mock prototype (seed data, fake detector, simulated flight) - no real model
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class MockConfig:
+    enabled: bool = True
+    reset_on_start: bool = False  # True: wipe and reseed on every start (and every --reload)
+    seed_if_empty: bool = True  # seed on start only when the database is missing, empty or has an old schema
+    reseed_on_seed_change: bool = True  # also reseed on start when seed_version or the seed files changed
+    seed_version: str = "2"  # bump to force a reseed on the next start (2 = real pothole photos)
+    seed_file: Path = ROOT / "mock" / "seed.json"
+    media_seed_dir: Path = ROOT / "mock" / "media"  # copied to PATHS.media_dir / "seed"
+    mission_duration_s: float = 45.0
+    model_version: str = "mock-0.1"
+    battery_start_pct: float = 95.0
+    battery_end_pct: float = 60.0
+    gimbal_survey_pitch_deg: float = -90.0
+    gimbal_transit_pitch_deg: float = -30.0
+    camera_live_delay_s: float = 2.0  # "requested" becomes "live" after this delay
+    edge_confirm_rate: float = 0.8  # share of missions where the edge model confirms damage
+    no_damage_rate: float = 0.25  # share of uploads the mock detector finds nothing in
+    # Flight planner + simulated flight (app/services/flight_planner.py, sim/mock_flight.py)
+    survey_points: int = 8  # waypoints on the survey circle around the target
+    replan_step_pct: float = 0.10  # altitude/radius change per step when the monitor requests changes (1-2 steps)
+    flight_phase_shares: tuple[float, float, float, float, float] = (0.10, 0.20, 0.40, 0.20, 0.10)
+    # ^ share of mission_duration_s for: takeoff climb, outbound leg, survey circle, return leg, landing descent
+    edge_max_detections: int = 3  # most fake edge detections per confirmed mission
+    edge_confidence_range: tuple[float, float] = (0.55, 0.95)
+    edge_jitter_m: float = 3.0  # fake edge detections are placed within this distance of the target
+    edge_deployment: str = "jetson-int8"  # deployment label of the fake edge (UAV) detections
+    edge_defect_size_m: tuple[float, float] = (0.5, 1.5)  # fake defect size range; sets the box size in pixels
+    # Mock detector boxes (deterministic from the file hash)
+    max_boxes: int = 3
+    confidence_range: tuple[float, float] = (0.45, 0.95)
+    box_size_range: tuple[float, float] = (0.12, 0.35)  # box side as a share of the image side
+    fallback_image_size: tuple[int, int] = (1280, 960)  # only if an upload's JPEG/PNG header cannot be read
+    # Media sub-folders under PATHS.media_dir (both are wiped by a reset)
+    seed_media_subdir: str = "seed"
+    upload_subdir: str = "uploads"
+    home_alt_m: float = 0.0  # simulated home altitude (UAV.home_lat/lon is the home position)
+    ingest_hold_s: float = 5.0  # a drone message from /telemetry/ingest overrides the simulation this long
+
+
 PATHS = PathsConfig()
 DATA = DataConfig()
 AUGMENT = AugmentConfig()
@@ -221,3 +264,4 @@ MLOPS = MlopsConfig()
 MONITOR = MonitorConfig()
 UAV = UavConfig()
 API = ApiConfig()
+MOCK = MockConfig()

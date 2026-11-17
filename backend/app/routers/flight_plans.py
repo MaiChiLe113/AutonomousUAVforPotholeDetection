@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import FlightPlan, Mission, MissionState, PlanStatus, Report, ReportStatus
 from app.routers.common import conflict, get_or_404, now_utc
-from app.schemas import FlightPlanOut, PlanDecision
+from app.schemas import FlightPlanOut, PlanDecision, ReportOut
+from app.services.dispatcher import cancel_task, dispatch_tick, enqueue_report
 from app.services.fleet import DroneStatus, get_drone_state, select_drone_for_target
 from app.services.flight_planner import FlightPlanner, OutOfServiceAreaError
 
@@ -133,3 +134,39 @@ def request_changes(plan_id: int, body: PlanDecision, db: Session = Depends(get_
     db.commit()
     db.refresh(new_plan)
     return new_plan
+
+
+@router.post("/reports/{report_id}/enqueue")
+def enqueue_report_endpoint(report_id: int, db: Session = Depends(get_db)) -> dict:
+    """Queue a confirmed report for automatic dispatch (merges within report_merge_radius_m)."""
+    try:
+        task = enqueue_report(db, report_id)
+    except OutOfServiceAreaError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "task_id": task.task_id,
+        "status": task.status.value,
+        "report_ids": task.report_ids,
+        "drone_id": task.drone_id,
+        "flight_plan_id": task.plan_id,
+        "mission_id": task.mission_id,
+    }
+
+
+@router.post("/reports/{report_id}/cancel", response_model=ReportOut)
+def cancel_queued_report(
+    report_id: int,
+    body: PlanDecision | None = None,
+    db: Session = Depends(get_db),
+) -> Report:
+    """Monitor override: cancel a queued inspection task and close its reports as rejected."""
+    reason = body.reason if body is not None else "Cancelled by monitor"
+    cancel_task(db, report_id, reason=reason)
+    return get_or_404(db, Report, report_id, "Report")
+
+
+@router.post("/dispatcher/tick")
+def trigger_dispatch_tick(db: Session = Depends(get_db)) -> dict:
+    """Advance active missions and dispatch any queued tasks."""
+    missions = dispatch_tick(db)
+    return {"dispatched_mission_ids": [m.id for m in missions]}

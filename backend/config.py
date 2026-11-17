@@ -233,6 +233,8 @@ class FleetConfig:
     base_lon: float = 106.7009
     base_alt_m: float = 0.0
     service_radius_m: float = 2_000.0
+    report_merge_radius_m: float = 15.0  # reports closer than this join an open task
+    max_task_retries: int = 1  # requeue once on edge failure, then flag for monitor
 
 
 # ---------------------------------------------------------------------------

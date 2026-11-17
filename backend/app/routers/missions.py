@@ -42,9 +42,11 @@ from app.schemas import (
     DetectionOut,
     MissionOut,
     MissionResultsIn,
+    PlanDecision,
     TelemetryIn,
     TelemetryOut,
 )
+from app.services.dispatcher import dispatch_tick, recall_mission
 from app.services.fleet import DroneStatus, MissionStart, get_drone_state, get_mission_start, record_mission_start
 from config import MOCK, UAV
 from sim.mock_flight import telemetry_at
@@ -56,6 +58,7 @@ _ACTIVE = (MissionState.pending, *FLYING_STATES)
 
 def _mission(db: Session, mission_id: int) -> Mission:
     """The mission, advanced to now."""
+    dispatch_tick(db)
     return sync_mission(db, get_or_404(db, Mission, mission_id, "Mission"))
 
 
@@ -63,6 +66,7 @@ def _mission(db: Session, mission_id: int) -> Mission:
 def list_missions(active: bool = False, db: Session = Depends(get_db)) -> list[Mission]:
     """Newest first. active=true: pending, takeoff, surveying or landing. SCRUM-39."""
     sync_active_missions(db)
+    dispatch_tick(db)
     query = select(Mission).order_by(Mission.id.desc())
     if active:
         query = query.where(Mission.state.in_(_ACTIVE))
@@ -135,6 +139,7 @@ def current_telemetry(db: Session, mission: Mission) -> UavTelemetry:
     - Pending / failed: the UAV parked at home (in_mission false).
     """
     now = now_utc()
+    dispatch_tick(db, now)
     sync_mission(db, mission, now)
     query = (
         select(UavTelemetry)
@@ -187,6 +192,16 @@ def upload_results(mission_id: int, body: MissionResultsIn, db: Session = Depend
         raise conflict(f"Mission {mission_id} already has results")
     return mission
 
+
+@router.post("/{mission_id}/recall", response_model=MissionOut)
+def recall_flying_mission(
+    mission_id: int,
+    body: PlanDecision | None = None,
+    db: Session = Depends(get_db),
+) -> Mission:
+    """Monitor override: recall a flying drone, return it to base, and requeue the task."""
+    reason = body.reason if body is not None else "Recalled by monitor"
+    return recall_mission(db, mission_id, reason=reason)
 
 
 @router.get("/{mission_id}/detections", response_model=list[DetectionOut])

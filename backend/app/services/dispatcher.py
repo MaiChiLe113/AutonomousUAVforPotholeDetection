@@ -22,6 +22,7 @@ from app.models import (
     ReportStatus,
 )
 from app.routers.common import conflict, get_or_404, now_utc, sync_mission
+from app.services.allocators import get_allocator
 from app.services.fleet import (
     DroneStatus,
     MissionEnd,
@@ -31,7 +32,6 @@ from app.services.fleet import (
     is_drone_offline,
     record_mission_end,
     record_mission_start,
-    select_drone_for_target,
 )
 from app.services.flight_planner import FlightPlanner, OutOfServiceAreaError
 from config import ENERGY, FLEET, EnergyConfig, FleetConfig
@@ -389,39 +389,42 @@ def _allocate_at(
     t_event: datetime,
     fleet_cfg: FleetConfig,
     energy_cfg: EnergyConfig,
+    *,
+    allocator: str | None = None,
 ) -> list[Mission]:
-    """Assign eligible queued tasks FIFO to the best available drone."""
+    """Assign eligible queued tasks using the configured allocator (`baseline` or `auction`)."""
     eligible = [t for t in list_tasks(db, TaskStatus.queued) if _utc(t.queued_at) <= t_event]
     if not eligible:
         return []
 
+    alloc = get_allocator(allocator or fleet_cfg.allocator)
+    fleet = get_fleet_state(db, t_event, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
+    winning_bids = alloc.allocate(db, eligible, fleet, t_event, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
+    if not winning_bids:
+        return []
+
     planner = FlightPlanner(energy=energy_cfg, fleet=fleet_cfg)
+    by_id = {t.task_id: t for t in eligible}
     dispatched: list[Mission] = []
 
-    for task in eligible:
-        chosen = select_drone_for_target(
-            db,
-            task.lat,
-            task.lon,
-            now=t_event,
-            fleet_cfg=fleet_cfg,
-            energy_cfg=energy_cfg,
-        )
-        if chosen is None:
+    for bid in winning_bids:
+        if bid.free_in_s > 0.0:
+            continue
+        task = by_id.get(bid.task_id)
+        if task is None:
             continue
 
-        start_pos = (chosen.lat, chosen.lon, chosen.altitude_m)
         proposal = planner.propose(
             task.lat,
             task.lon,
-            drone_id=chosen.drone_id,
-            start_pos=start_pos,
-            start_battery_pct=chosen.battery_pct,
+            drone_id=bid.drone_id,
+            start_pos=bid.start_pos,
+            start_battery_pct=bid.start_battery_pct,
             return_to_home=False,
         )
         plan = FlightPlan(
             report_id=task.task_id,
-            drone_id=chosen.drone_id,
+            drone_id=bid.drone_id,
             altitude_m=proposal.altitude_m,
             survey_radius_m=proposal.survey_radius_m,
             route=list(proposal.route),
@@ -444,12 +447,12 @@ def _allocate_at(
         record_mission_start(
             db,
             mission,
-            MissionStart(start_pos[0], start_pos[1], start_pos[2], chosen.battery_pct),
+            MissionStart(bid.start_pos[0], bid.start_pos[1], bid.start_pos[2], bid.start_battery_pct),
         )
         _mark_tasks_dispatched(
             db,
             [task],
-            drone_id=chosen.drone_id,
+            drone_id=bid.drone_id,
             plan_id=plan.id,
             mission_id=mission.id,
         )
@@ -462,6 +465,7 @@ def dispatch_tick(
     db: Session,
     now: datetime | None = None,
     *,
+    allocator: str | None = None,
     fleet_cfg: FleetConfig = FLEET,
     energy_cfg: EnergyConfig = ENERGY,
 ) -> list[Mission]:
@@ -509,7 +513,7 @@ def dispatch_tick(
 
         allocated_before_mission = False
         for avail_t in sorted(set(avail_times)):
-            dispatched_here = _allocate_at(db, avail_t, fleet_cfg, energy_cfg)
+            dispatched_here = _allocate_at(db, avail_t, fleet_cfg, energy_cfg, allocator=allocator)
             if dispatched_here:
                 dispatched.extend(dispatched_here)
                 allocated_before_mission = True
@@ -527,10 +531,10 @@ def dispatch_tick(
                     task.status = TaskStatus.completed
                     save_task(db, task)
                     _sync_task_report_statuses(db, task, earliest_m.report.status)
-            dispatched.extend(_allocate_at(db, earliest_m_end, fleet_cfg, energy_cfg))
+            dispatched.extend(_allocate_at(db, earliest_m_end, fleet_cfg, energy_cfg, allocator=allocator))
             continue
 
-        dispatched.extend(_allocate_at(db, t_now, fleet_cfg, energy_cfg))
+        dispatched.extend(_allocate_at(db, t_now, fleet_cfg, energy_cfg, allocator=allocator))
         break
 
     db.commit()
@@ -543,6 +547,7 @@ def enqueue_report(
     now: datetime | None = None,
     *,
     auto_dispatch: bool = True,
+    allocator: str | None = None,
     fleet_cfg: FleetConfig = FLEET,
     energy_cfg: EnergyConfig = ENERGY,
 ) -> InspectionTask:
@@ -590,7 +595,7 @@ def enqueue_report(
     )
     save_task(db, task, commit=not auto_dispatch)
     if auto_dispatch:
-        dispatch_tick(db, t_now, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
+        dispatch_tick(db, t_now, allocator=allocator, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
         return get_task(db, task.task_id) or task
     return task
 

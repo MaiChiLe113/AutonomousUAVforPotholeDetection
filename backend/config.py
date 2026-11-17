@@ -235,6 +235,28 @@ class FleetConfig:
     service_radius_m: float = 2_000.0
     report_merge_radius_m: float = 15.0  # reports closer than this join an open task
     max_task_retries: int = 1  # requeue once on edge failure, then flag for monitor
+    allocator: str = "baseline"  # "baseline" | "auction"
+
+
+# ---------------------------------------------------------------------------
+# Seeded scenario benchmarks (docs/fleet-plan.md §7 Phase 4, §9)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ScenarioConfig:
+    """Seeded simulation workloads for allocator and scale-out evaluation."""
+
+    seeds: tuple[int, ...] = (42, 43, 44)
+    burst_reports: int = 10
+    burst_span_s: float = 60.0  # 10 reports arrive within 60 simulated seconds (Scenario S6)
+    light_reports: int = 10
+    light_interval_s: float = 240.0  # 1 report every 4 simulated minutes
+    scale_out_drones: tuple[int, ...] = (3, 5, 10)
+    scale_out_reports: int = 15
+    scale_out_span_s: float = 90.0
+    horizon_s: float = 14_400.0  # 4 simulated hours max horizon to drain the queue
+    step_s: float = 5.0  # simulation clock step when advancing between arrivals
+    min_target_dist_m: float = 150.0
+    max_target_dist_m: float = 1_900.0
 
 
 # ---------------------------------------------------------------------------
@@ -305,5 +327,6 @@ MONITOR = MonitorConfig()
 UAV = UavConfig()
 ENERGY = EnergyConfig()
 FLEET = FleetConfig()
+SCENARIOS = ScenarioConfig()
 API = ApiConfig()
 MOCK = MockConfig()

@@ -263,6 +263,23 @@ class ScenarioConfig:
 
 
 # ---------------------------------------------------------------------------
+# Edge worker / Raspberry Pi 3 B+ HIL (docs/fleet-plan.md §5, §7 Phase 6)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class EdgeWorkerConfig:
+    """Raspberry Pi 3 B+ hardware-in-the-loop edge worker settings."""
+
+    pi_drone_id: str = "sim-uav-1"
+    worker_url: str = _env("PI_WORKER_URL", "")  # e.g. "http://192.168.1.50:8001"; empty = fallback
+    host: str = "0.0.0.0"
+    port: int = 8001
+    timeout_s: float = 5.0
+    fallback_latency_ms: float = 350.0  # used by mock edge when Pi is unreachable or for drones 2 & 3
+    latency_jitter_ms: float = 25.0
+    pi_deployment: str = "pi-ncnn"  # "pi-int8" only when verified INT8 quantisation is active
+
+
+# ---------------------------------------------------------------------------
 # API server - SCRUM-23
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -331,5 +348,6 @@ UAV = UavConfig()
 ENERGY = EnergyConfig()
 FLEET = FleetConfig()
 SCENARIOS = ScenarioConfig()
+EDGE_WORKER = EdgeWorkerConfig()
 API = ApiConfig()
 MOCK = MockConfig()

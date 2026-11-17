@@ -17,7 +17,7 @@ from app.services.fleet import (
     DroneStatus,
     get_mission_start,
 )
-from app.services.flight_planner import FlightPlanner, OutOfServiceAreaError
+from app.services.flight_planner import FlightPlanner, OutOfServiceAreaError, extract_route_targets
 from config import ENERGY, FLEET, SCENARIOS, EnergyConfig, FleetConfig, ScenarioConfig
 from sim.energy import destination, estimate, haversine_m
 
@@ -59,6 +59,23 @@ def transit_to_target_s(
             break
         total += leg.duration_s
     return round(total, 4)
+
+
+def target_arrival_times_s(
+    route: list[dict],
+    *,
+    start_pos: tuple[float, float, float],
+    start_battery_pct: float,
+    energy_cfg: EnergyConfig = ENERGY,
+) -> list[tuple[tuple[float, float], float]]:
+    """Return `((target_lat, target_lon), arrival_s)` for every stop in `route`."""
+    est = estimate(route, start_battery_pct=start_battery_pct, start_pos=start_pos, cfg=energy_cfg)
+    targets = extract_route_targets(route)
+    survey_starts: list[float] = []
+    for idx, leg in enumerate(est.legs):
+        if leg.phase == "survey" and (idx == 0 or est.legs[idx - 1].phase != "survey"):
+            survey_starts.append(round(leg.t0, 4))
+    return list(zip(targets, survey_starts, strict=False))
 
 
 @dataclass(frozen=True)
@@ -193,6 +210,27 @@ def _base_recovery(
     return landed_t, landed_bat
 
 
+def _remaining_targets_for_mission(
+    route: list[dict],
+    elapsed_s: float,
+    *,
+    start_pos: tuple[float, float, float],
+    start_battery_pct: float,
+    energy_cfg: EnergyConfig,
+) -> tuple[str, list[tuple[float, float]]]:
+    est = estimate(route, start_battery_pct=start_battery_pct, start_pos=start_pos, cfg=energy_cfg)
+    if elapsed_s >= est.duration_s:
+        return "done", []
+    cur_leg = next((lg for lg in est.legs if elapsed_s < lg.t1), est.legs[-1])
+    targets = extract_route_targets(route)
+    survey_end_times: list[float] = []
+    for idx, leg in enumerate(est.legs):
+        if leg.phase == "survey" and (idx + 1 == len(est.legs) or est.legs[idx + 1].phase != "survey"):
+            survey_end_times.append(leg.t1)
+    rem = [tgt for tgt, end_t in zip(targets, survey_end_times, strict=False) if end_t > elapsed_s]
+    return cur_leg.phase, rem
+
+
 def _project_drone(
     db: Session,
     d: DroneState,
@@ -200,6 +238,8 @@ def _project_drone(
     now: datetime,
     fleet_cfg: FleetConfig,
     energy_cfg: EnergyConfig,
+    *,
+    re_tasking: bool = False,
 ) -> _ProjectedDrone | None:
     if d.status == DroneStatus.offline:
         return None
@@ -244,6 +284,18 @@ def _project_drone(
             if ret_est.end_battery_pct < energy_cfg.swap_below_pct
             else ret_est.end_battery_pct
         )
+        if re_tasking:
+            return _ProjectedDrone(
+                d.drone_id,
+                order,
+                0.0,
+                d.position,
+                d.battery_pct,
+                base,
+                d.available_sim_s,
+                end_bat,
+                rem_to_base_s=ret_est.duration_s,
+            )
         return _ProjectedDrone(
             d.drone_id,
             order,
@@ -294,7 +346,32 @@ def _project_drone(
             cfg=energy_cfg,
         ).duration_s
     )
-    return _ProjectedDrone(d.drone_id, order, rem_s, end_pt, end_bat, base, base_t, base_bat, rem_home_at_end)
+    proj = _ProjectedDrone(d.drone_id, order, rem_s, end_pt, end_bat, base, base_t, base_bat, rem_home_at_end)
+    if re_tasking:
+        elapsed_s = max(0.0, (t_now - _utc(mission.started_at)).total_seconds())
+        cur_phase, rem_targets = _remaining_targets_for_mission(
+            mission.flight_plan.route,
+            elapsed_s,
+            start_pos=m_start.pos,
+            start_battery_pct=m_start.battery_pct,
+            energy_cfg=energy_cfg,
+        )
+        if cur_phase != "survey" and 0 < len(rem_targets) < fleet_cfg.max_stops_per_plan:
+            planner = FlightPlanner(energy=energy_cfg, fleet=fleet_cfg)
+            cur_rth = planner.propose_multi(
+                rem_targets,
+                drone_id=d.drone_id,
+                start_pos=d.position,
+                start_battery_pct=d.battery_pct,
+                return_to_home=True,
+            )
+            proj.active_mission_id = mission.id
+            proj.live_pos = d.position
+            proj.live_bat = d.battery_pct
+            proj.rem_targets = tuple(rem_targets)
+            proj.cur_rem_route_s = cur_rth.estimated_duration_s
+            proj.can_mid_leg_insert = True
+    return proj
 
 
 def _bid_from_state(
@@ -340,13 +417,85 @@ def _bid_from_state(
     )
 
 
-def _candidate_bid(
+def _mid_leg_insertion_bid(
     task: InspectionTask,
     proj: _ProjectedDrone,
     planner: FlightPlanner,
     fleet_cfg: FleetConfig,
     energy_cfg: EnergyConfig,
 ) -> Bid | None:
+    if not proj.can_mid_leg_insert or proj.live_pos is None or proj.active_mission_id is None:
+        return None
+    tgt = (task.lat, task.lon)
+    near_route = haversine_m(proj.live_pos[:2], tgt) <= fleet_cfg.multi_stop_radius_m or any(
+        haversine_m(stop, tgt) <= fleet_cfg.multi_stop_radius_m for stop in proj.rem_targets
+    )
+    if not near_route:
+        return None
+
+    candidates: list[list[tuple[float, float]]] = [list(proj.rem_targets) + [tgt]]
+    if haversine_m(proj.live_pos[:2], tgt) < haversine_m(proj.live_pos[:2], proj.rem_targets[0]):
+        candidates.append([tgt] + list(proj.rem_targets))
+
+    best_prop = None
+    best_targets: list[tuple[float, float]] | None = None
+    for cand in candidates:
+        try:
+            prop = planner.propose_multi(
+                cand,
+                drone_id=proj.drone_id,
+                start_pos=proj.live_pos,
+                start_battery_pct=proj.live_bat,
+                return_to_home=True,
+            )
+        except OutOfServiceAreaError:
+            continue
+        if proj.live_bat - prop.estimated_battery_pct < energy_cfg.reserve_pct:
+            continue
+        if best_prop is None or prop.estimated_duration_s < best_prop.estimated_duration_s:
+            best_prop = prop
+            best_targets = cand
+
+    if best_prop is None or best_targets is None:
+        return None
+
+    arrivals = target_arrival_times_s(
+        best_prop.route,
+        start_pos=proj.live_pos,
+        start_battery_pct=proj.live_bat,
+        energy_cfg=energy_cfg,
+    )
+    task_arr = next(
+        (t_arr for pos_xy, t_arr in arrivals if haversine_m(pos_xy, tgt) < 1.0),
+        best_prop.estimated_duration_s,
+    )
+    extra_s = max(0.0, best_prop.estimated_duration_s - proj.cur_rem_route_s)
+    return Bid(
+        task_id=task.task_id,
+        drone_id=proj.drone_id,
+        arrival_s=task_arr,
+        free_in_s=0.0,
+        start_pos=proj.live_pos,
+        start_battery_pct=proj.live_bat,
+        insertion_cost_s=extra_s,
+        insert_into_mission_id=proj.active_mission_id,
+        ordered_targets=tuple(best_targets),
+    )
+
+
+def _candidate_bid(
+    task: InspectionTask,
+    proj: _ProjectedDrone,
+    planner: FlightPlanner,
+    fleet_cfg: FleetConfig,
+    energy_cfg: EnergyConfig,
+    *,
+    re_tasking: bool = False,
+) -> Bid | None:
+    if re_tasking and proj.can_mid_leg_insert:
+        splice_bid = _mid_leg_insertion_bid(task, proj, planner, fleet_cfg, energy_cfg)
+        if splice_bid is not None:
+            return splice_bid
     direct = _bid_from_state(
         task,
         proj,
@@ -364,10 +513,63 @@ def _candidate_bid(
     return None
 
 
+def _attach_nearby_stops(
+    primary: InspectionTask,
+    win_bid: Bid,
+    unassigned: list[InspectionTask],
+    planner: FlightPlanner,
+    fleet_cfg: FleetConfig,
+    energy_cfg: EnergyConfig,
+) -> tuple[tuple[int, ...], tuple[tuple[float, float], ...], list[InspectionTask]]:
+    grouped_ids = [primary.task_id]
+    targets: list[tuple[float, float]] = [(primary.lat, primary.lon)]
+    added: list[InspectionTask] = []
+
+    while len(targets) < fleet_cfg.max_stops_per_plan and unassigned:
+        last_pt = targets[-1]
+        nearby = [
+            (haversine_m(last_pt, (t.lat, t.lon)), _utc(t.created_at), t.task_id, t)
+            for t in unassigned
+            if haversine_m(last_pt, (t.lat, t.lon)) <= fleet_cfg.multi_stop_radius_m
+        ]
+        if not nearby:
+            break
+        nearby.sort(key=lambda item: (item[0], item[1], item[2]))
+        picked = False
+        for _, _, _, cand in nearby:
+            cand_targets = [*targets, (cand.lat, cand.lon)]
+            try:
+                rth = planner.propose_multi(
+                    cand_targets,
+                    drone_id=win_bid.drone_id,
+                    start_pos=win_bid.start_pos,
+                    start_battery_pct=win_bid.start_battery_pct,
+                    return_to_home=True,
+                )
+            except OutOfServiceAreaError:
+                continue
+            if win_bid.start_battery_pct - rth.estimated_battery_pct >= energy_cfg.reserve_pct:
+                grouped_ids.append(cand.task_id)
+                targets.append((cand.lat, cand.lon))
+                added.append(cand)
+                unassigned.remove(cand)
+                picked = True
+                break
+        if not picked:
+            break
+
+    return tuple(grouped_ids), tuple(targets), added
+
+
 class AuctionAllocator:
-    """Lowest arrival-time bidder over all open (task, drone) pairs; breaks ties FIFO then drone id."""
+    """Lowest arrival-time (or insertion-cost when re_tasking=True) bidder over all open pairs."""
 
     name = "auction"
+    re_tasking: bool = False
+
+    def __init__(self, *, re_tasking: bool | None = None) -> None:
+        if re_tasking is not None:
+            self.re_tasking = re_tasking
 
     def allocate(
         self,
@@ -379,58 +581,66 @@ class AuctionAllocator:
         fleet_cfg: FleetConfig = FLEET,
         energy_cfg: EnergyConfig = ENERGY,
     ) -> list[Bid]:
-        from app.services.dispatcher import TaskStatus
-
-        queued = [t for t in tasks if t.status == TaskStatus.queued]
-        if not queued:
-            return []
-
-        projections = [
+        active_retask = self.re_tasking or fleet_cfg.re_tasking
+        planner = FlightPlanner(energy=energy_cfg, fleet=fleet_cfg)
+        projected = [
             p
             for order, d in enumerate(fleet)
-            if (p := _project_drone(db, d, order, now, fleet_cfg, energy_cfg)) is not None
+            if (p := _project_drone(db, d, order, now, fleet_cfg, energy_cfg, re_tasking=active_retask)) is not None
         ]
-        if not projections:
+        if not projected or not tasks:
             return []
 
-        planner = FlightPlanner(energy=energy_cfg, fleet=fleet_cfg)
-        unassigned = list(queued)
+        unassigned = sorted(tasks, key=lambda t: (_utc(t.created_at), t.task_id))
         immediate_bids: list[Bid] = []
 
         while unassigned:
-            best_pair: tuple[tuple[float, float, int, int], InspectionTask, _ProjectedDrone, Bid] | None = None
+            best_pair: (
+                tuple[tuple[float, float, datetime, int, int], InspectionTask, _ProjectedDrone, Bid] | None
+            ) = None
             for task in unassigned:
-                for proj in projections:
-                    bid = _candidate_bid(task, proj, planner, fleet_cfg, energy_cfg)
+                for proj in projected:
+                    bid = _candidate_bid(task, proj, planner, fleet_cfg, energy_cfg, re_tasking=active_retask)
                     if bid is None:
                         continue
-                    key2 = (round(bid.arrival_s, 4), _utc(task.created_at).timestamp(), task.task_id, proj.order)
-                    if best_pair is None or key2 < best_pair[0]:
-                        best_pair = (key2, task, proj, bid)
+                    primary_score = round(bid.insertion_cost_s, 4) if active_retask else round(bid.arrival_s, 4)
+                    key = (primary_score, round(bid.arrival_s, 4), _utc(task.created_at), task.task_id, proj.order)
+                    if best_pair is None or key < best_pair[0]:
+                        best_pair = (key, task, proj, bid)
 
             if best_pair is None:
                 break
 
             _, win_task, win_proj, win_bid = best_pair
             unassigned.remove(win_task)
-            if win_bid.free_in_s == 0.0:
-                immediate_bids.append(win_bid)
 
-            survey_prop = planner.propose(
-                win_task.lat,
-                win_task.lon,
+            grouped_ids = (win_task.task_id,)
+            targets = win_bid.ordered_targets or ((win_task.lat, win_task.lon),)
+            if active_retask and win_bid.insert_into_mission_id is None and win_bid.free_in_s == 0.0:
+                grouped_ids, targets, _ = _attach_nearby_stops(
+                    win_task, win_bid, unassigned, planner, fleet_cfg, energy_cfg
+                )
+
+            final_bid = replace(win_bid, grouped_task_ids=grouped_ids, ordered_targets=targets)
+            if final_bid.free_in_s == 0.0:
+                immediate_bids.append(final_bid)
+
+            survey_prop = planner.propose_multi(
+                list(targets),
                 drone_id=win_proj.drone_id,
-                start_pos=win_bid.start_pos,
-                start_battery_pct=win_bid.start_battery_pct,
+                start_pos=final_bid.start_pos,
+                start_battery_pct=final_bid.start_battery_pct,
                 return_to_home=False,
             )
             last_wp = survey_prop.route[-1]
-            new_t = win_bid.free_in_s + survey_prop.estimated_duration_s
+            new_t = final_bid.free_in_s + survey_prop.estimated_duration_s
             new_pos = (float(last_wp["lat"]), float(last_wp["lon"]), float(last_wp["alt"]))
-            new_bat = max(0.0, win_bid.start_battery_pct - survey_prop.estimated_battery_pct)
+            new_bat = max(0.0, final_bid.start_battery_pct - survey_prop.estimated_battery_pct)
             win_proj.free_in_s = new_t
             win_proj.pos = new_pos
             win_proj.battery_pct = new_bat
+            win_proj.can_mid_leg_insert = False
+            win_proj.active_mission_id = None
             win_proj.rem_to_base_s = (
                 0.0
                 if _at_base_ground(new_pos, win_proj.base)
@@ -448,9 +658,17 @@ class AuctionAllocator:
         return immediate_bids
 
 
+class InsertionAllocator(AuctionAllocator):
+    """Phase 5 scale-up bidder: multi-stop grouping + mid-leg & mid-return insertion."""
+
+    name = "insertion"
+    re_tasking = True
+
+
 _ALLOCATORS: dict[str, type[BaselineAllocator] | type[AuctionAllocator]] = {
     "baseline": BaselineAllocator,
     "auction": AuctionAllocator,
+    "insertion": InsertionAllocator,
 }
 
 
@@ -506,6 +724,7 @@ def _generate_arrivals(
 
 def _total_battery_used(db: Session, fleet_cfg: FleetConfig, energy_cfg: EnergyConfig) -> float:
     from app.models import FlightPlan
+    from app.services.dispatcher import get_pre_splice_battery_used
 
     base = (fleet_cfg.base_lat, fleet_cfg.base_lon, fleet_cfg.base_alt_m)
     total = 0.0
@@ -527,7 +746,7 @@ def _total_battery_used(db: Session, fleet_cfg: FleetConfig, energy_cfg: EnergyC
                 start_pos=m_start.pos,
                 cfg=energy_cfg,
             )
-            total += est.battery_used_pct
+            total += est.battery_used_pct + get_pre_splice_battery_used(db, m.id)
             end_pt = est.legs[-1].end
             if not _at_base_ground(end_pt, base):
                 m_end = _utc(m.started_at) + timedelta(seconds=est.duration_s)
@@ -626,7 +845,19 @@ def run_scenario(
             if m is None or m.started_at is None:
                 continue
             m_start = get_mission_start(db, m, fleet_cfg=active_fleet, energy_cfg=energy_cfg)
-            transit_s = transit_to_target_s(
+            arrivals_for_m = target_arrival_times_s(
+                m.flight_plan.route,
+                start_pos=m_start.pos,
+                start_battery_pct=m_start.battery_pct,
+                energy_cfg=energy_cfg,
+            )
+            if arrivals_for_m:
+                _, transit_s = min(
+                    arrivals_for_m,
+                    key=lambda item: haversine_m(item[0], (task.lat, task.lon)),
+                )
+            else:
+                transit_s = transit_to_target_s(
                     m.flight_plan.route,
                     start_pos=m_start.pos,
                     start_battery_pct=m_start.battery_pct,

@@ -40,6 +40,8 @@ from sim.mock_flight import telemetry_at
 
 _TASK_PREFIX = "dispatcher:task:"
 _EDGE_FAIL_PREFIX = "dispatcher:edge_fail:"
+_PLAN_REPORTS_PREFIX = "dispatcher:plan_reports:"
+_SPLICE_BAT_PREFIX = "dispatcher:splice_bat:"
 
 
 class TaskStatus(enum.StrEnum):
@@ -166,6 +168,37 @@ def get_task_for_mission(db: Session, mission_id: int) -> InspectionTask | None:
     tasks = get_tasks_for_mission(db, mission_id)
     return tasks[0] if tasks else None
 
+
+def record_plan_reports(db: Session, plan_id: int, report_ids: list[int], *, commit: bool = False) -> list[int]:
+    """Store the ordered list of report IDs served by a single- or multi-stop flight plan."""
+    unique = list(dict.fromkeys(int(rid) for rid in report_ids))
+    _upsert_meta(db, f"{_PLAN_REPORTS_PREFIX}{plan_id}", json.dumps(unique))
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return unique
+
+
+def get_plan_reports(db: Session, plan_id: int) -> list[int]:
+    """Return all report IDs linked to `plan_id`."""
+    row = db.get(AppMeta, f"{_PLAN_REPORTS_PREFIX}{plan_id}")
+    if row is not None:
+        return [int(rid) for rid in json.loads(row.value)]
+    plan = db.get(FlightPlan, plan_id)
+    return [plan.report_id] if plan is not None else []
+
+
+def _add_pre_splice_battery(db: Session, mission_id: int, extra_bat_pct: float) -> None:
+    key = f"{_SPLICE_BAT_PREFIX}{mission_id}"
+    row = db.get(AppMeta, key)
+    prev = float(row.value) if row is not None else 0.0
+    _upsert_meta(db, key, f"{prev + max(0.0, extra_bat_pct):.4f}")
+
+
+def get_pre_splice_battery_used(db: Session, mission_id: int) -> float:
+    row = db.get(AppMeta, f"{_SPLICE_BAT_PREFIX}{mission_id}")
+    return float(row.value) if row is not None else 0.0
 
 
 def _sync_task_report_statuses(
@@ -410,20 +443,57 @@ def _allocate_at(
     for bid in winning_bids:
         if bid.free_in_s > 0.0:
             continue
-        task = by_id.get(bid.task_id)
-        if task is None:
+        task_ids = list(bid.grouped_task_ids) if bid.grouped_task_ids else [bid.task_id]
+        tasks_for_bid = [by_id[tid] for tid in task_ids if tid in by_id]
+        if not tasks_for_bid:
+            continue
+        targets = list(bid.ordered_targets) if bid.ordered_targets else [(t.lat, t.lon) for t in tasks_for_bid]
+
+        if bid.insert_into_mission_id is not None:
+            mission = db.get(Mission, bid.insert_into_mission_id)
+            if mission is None:
+                continue
+            prev_start = get_mission_start(db, mission, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
+            _add_pre_splice_battery(db, mission.id, prev_start.battery_pct - bid.start_battery_pct)
+            new_prop = planner.propose_multi(
+                targets,
+                drone_id=bid.drone_id,
+                start_pos=bid.start_pos,
+                start_battery_pct=bid.start_battery_pct,
+                return_to_home=False,
+            )
+            mission.flight_plan.route = list(new_prop.route)
+            mission.started_at = t_event
+            record_mission_start(
+                db,
+                mission,
+                MissionStart(bid.start_pos[0], bid.start_pos[1], bid.start_pos[2], bid.start_battery_pct),
+            )
+            combined_reports = get_plan_reports(db, mission.flight_plan_id) + [
+                rid for t in tasks_for_bid for rid in t.report_ids
+            ]
+            record_plan_reports(db, mission.flight_plan_id, combined_reports)
+            _mark_tasks_dispatched(
+                db,
+                tasks_for_bid,
+                drone_id=bid.drone_id,
+                plan_id=mission.flight_plan_id,
+                mission_id=mission.id,
+            )
+            db.flush()
+            if mission not in dispatched:
+                dispatched.append(mission)
             continue
 
-        proposal = planner.propose(
-            task.lat,
-            task.lon,
+        proposal = planner.propose_multi(
+            targets,
             drone_id=bid.drone_id,
             start_pos=bid.start_pos,
             start_battery_pct=bid.start_battery_pct,
             return_to_home=False,
         )
         plan = FlightPlan(
-            report_id=task.task_id,
+            report_id=tasks_for_bid[0].task_id,
             drone_id=bid.drone_id,
             altitude_m=proposal.altitude_m,
             survey_radius_m=proposal.survey_radius_m,
@@ -437,7 +507,7 @@ def _allocate_at(
 
         mission = Mission(
             flight_plan_id=plan.id,
-            report_id=task.task_id,
+            report_id=tasks_for_bid[0].task_id,
             state=MissionState.takeoff,
             started_at=t_event,
         )
@@ -449,9 +519,10 @@ def _allocate_at(
             mission,
             MissionStart(bid.start_pos[0], bid.start_pos[1], bid.start_pos[2], bid.start_battery_pct),
         )
+        record_plan_reports(db, plan.id, [rid for t in tasks_for_bid for rid in t.report_ids])
         _mark_tasks_dispatched(
             db,
-            [task],
+            tasks_for_bid,
             drone_id=bid.drone_id,
             plan_id=plan.id,
             mission_id=mission.id,
@@ -460,6 +531,7 @@ def _allocate_at(
         dispatched.append(mission)
 
     return dispatched
+
 
 def dispatch_tick(
     db: Session,

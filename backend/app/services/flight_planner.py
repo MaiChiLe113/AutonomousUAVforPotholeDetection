@@ -24,7 +24,7 @@ class ProposedPlan:
     drone_id: str
     altitude_m: float
     survey_radius_m: float
-    route: list[dict]  # [{"lat", "lon", "alt", "action"}], takeoff -> target -> survey -> land
+    route: list[dict]  # [{"lat", "lon", "alt", "action"}]
     estimated_duration_s: float = 0.0
     estimated_battery_pct: float = 0.0
     start_battery_pct: float = ENERGY.full_battery_pct
@@ -48,6 +48,29 @@ def _replan_factors(reason: str, step_pct: float) -> tuple[float, float]:
     return (1 + step_pct) ** alt_steps, (1 + step_pct) ** rad_steps
 
 
+def extract_route_targets(route: list[dict], survey_points: int = MOCK.survey_points) -> list[tuple[float, float]]:
+    """Extract ordered survey target centres from a single-stop or multi-stop route."""
+    pts_per_stop = max(1, int(survey_points))
+    targets: list[tuple[float, float]] = []
+    i = 0
+    while i < len(route):
+        if route[i].get("action") != "survey":
+            i += 1
+            continue
+        if i > 0 and route[i - 1].get("action") == "fly":
+            targets.append((float(route[i - 1]["lat"]), float(route[i - 1]["lon"])))
+            i += pts_per_stop
+        else:
+            run: list[dict] = []
+            while i < len(route) and route[i].get("action") == "survey" and len(run) < pts_per_stop:
+                run.append(route[i])
+                i += 1
+            targets.append(
+                (sum(float(w["lat"]) for w in run) / len(run), sum(float(w["lon"]) for w in run) / len(run))
+            )
+    return targets
+
+
 class FlightPlanner:
     def __init__(
         self,
@@ -61,10 +84,9 @@ class FlightPlanner:
         self.energy = energy
         self.fleet = fleet
 
-    def propose(
+    def propose_multi(
         self,
-        target_lat: float,
-        target_lon: float,
+        targets: list[tuple[float, float]],
         previous_reason: str | None = None,
         *,
         drone_id: str | None = None,
@@ -72,19 +94,22 @@ class FlightPlanner:
         start_battery_pct: float | None = None,
         return_to_home: bool = True,
     ) -> ProposedPlan:
-        """Build a survey route and energy/time estimate for a target pin."""
+        """Build a single-stop or multi-stop survey route and energy/time estimate."""
+        if not targets:
+            raise ValueError("targets is empty")
+
         home = (
             (self.cfg.home_lat, self.cfg.home_lon)
             if self.fleet is FLEET
             else (self.fleet.base_lat, self.fleet.base_lon)
         )
-        target = (float(target_lat), float(target_lon))
-        dist_from_base_m = haversine_m(home, target)
-        if dist_from_base_m > self.fleet.service_radius_m + 1e-3:
-            raise OutOfServiceAreaError(
-                f"Target ({target_lat:.5f}, {target_lon:.5f}) is {dist_from_base_m:.0f} m from base, "
-                f"outside the {self.fleet.service_radius_m:.0f} m service area"
-            )
+        for target_lat, target_lon in targets:
+            dist_from_base_m = haversine_m(home, (target_lat, target_lon))
+            if dist_from_base_m > self.fleet.service_radius_m + 1e-3:
+                raise OutOfServiceAreaError(
+                    f"Target ({target_lat:.5f}, {target_lon:.5f}) is {dist_from_base_m:.0f} m from base, "
+                    f"outside the {self.fleet.service_radius_m:.0f} m service area"
+                )
 
         altitude = self.cfg.default_altitude_m
         radius = self.cfg.survey_radius_m
@@ -103,21 +128,23 @@ class FlightPlanner:
             origin_alt = float(start_pos[2]) if len(start_pos) == 3 else 0.0
             in_air = origin_alt > 0.0
 
-        start = bearing_deg(origin, target) if origin != target else 0.0
         points = max(1, self.mock.survey_points)
-
         first_wp = (
             {"lat": origin[0], "lon": origin[1], "alt": origin_alt, "action": "fly"}
             if in_air
             else {"lat": origin[0], "lon": origin[1], "alt": altitude, "action": "takeoff"}
         )
-        route = [
-            first_wp,
-            {"lat": target[0], "lon": target[1], "alt": altitude, "action": "fly"},
-        ]
-        for k in range(points):
-            lat, lon = destination(target, start + 360.0 * k / points, radius)
-            route.append({"lat": round(lat, 7), "lon": round(lon, 7), "alt": altitude, "action": "survey"})
+        route = [first_wp]
+        prev_pt = origin
+        for target_lat, target_lon in targets:
+            target = (float(target_lat), float(target_lon))
+            start_brg = bearing_deg(prev_pt, target) if prev_pt != target else 0.0
+            route.append({"lat": target[0], "lon": target[1], "alt": altitude, "action": "fly"})
+            for k in range(points):
+                lat, lon = destination(target, start_brg + 360.0 * k / points, radius)
+                route.append({"lat": round(lat, 7), "lon": round(lon, 7), "alt": altitude, "action": "survey"})
+            prev_pt = target
+
         if return_to_home:
             route += [
                 {"lat": home[0], "lon": home[1], "alt": altitude, "action": "fly"},
@@ -133,4 +160,25 @@ class FlightPlanner:
             estimated_duration_s=est.duration_s,
             estimated_battery_pct=est.battery_used_pct,
             start_battery_pct=start_bat,
+        )
+
+    def propose(
+        self,
+        target_lat: float,
+        target_lon: float,
+        previous_reason: str | None = None,
+        *,
+        drone_id: str | None = None,
+        start_pos: tuple[float, float] | tuple[float, float, float] | None = None,
+        start_battery_pct: float | None = None,
+        return_to_home: bool = True,
+    ) -> ProposedPlan:
+        """Build a survey route and energy/time estimate for a target pin."""
+        return self.propose_multi(
+            [(target_lat, target_lon)],
+            previous_reason=previous_reason,
+            drone_id=drone_id,
+            start_pos=start_pos,
+            start_battery_pct=start_battery_pct,
+            return_to_home=return_to_home,
         )

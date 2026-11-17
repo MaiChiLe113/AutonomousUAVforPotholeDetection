@@ -235,7 +235,10 @@ class FleetConfig:
     service_radius_m: float = 2_000.0
     report_merge_radius_m: float = 15.0  # reports closer than this join an open task
     max_task_retries: int = 1  # requeue once on edge failure, then flag for monitor
-    allocator: str = "baseline"  # "baseline" | "auction"
+    allocator: str = "baseline"  # "baseline" | "auction" | "insertion"
+    multi_stop_radius_m: float = 400.0  # nearby tasks within this radius can share one multi-stop plan
+    max_stops_per_plan: int = 3  # maximum targets visited in a single flight plan
+    re_tasking: bool = False  # enable mid-leg / mid-return insertion when using auction/insertion
 
 
 # ---------------------------------------------------------------------------

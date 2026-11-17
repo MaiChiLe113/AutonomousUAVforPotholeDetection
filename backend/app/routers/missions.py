@@ -30,15 +30,24 @@ from app.routers.common import (
     get_or_404,
     mission_duration_s,
     mission_elapsed_s,
+    mission_home,
     now_utc,
     seconds_between,
-    simulated_sample,
     store_sample,
     sync_active_missions,
     sync_mission,
 )
-from app.schemas import CameraSessionOut, DetectionOut, MissionOut, MissionResultsIn, TelemetryIn, TelemetryOut
+from app.schemas import (
+    CameraSessionOut,
+    DetectionOut,
+    MissionOut,
+    MissionResultsIn,
+    TelemetryIn,
+    TelemetryOut,
+)
+from app.services.fleet import DroneStatus, MissionStart, get_drone_state, get_mission_start, record_mission_start
 from config import MOCK, UAV
+from sim.mock_flight import telemetry_at
 
 router = APIRouter(prefix="/missions", tags=["missions"])
 
@@ -69,7 +78,8 @@ def get_mission(mission_id: int, db: Session = Depends(get_db)) -> Mission:
 @router.post("/{mission_id}/dispatch", response_model=MissionOut)
 def dispatch_mission(mission_id: int, db: Session = Depends(get_db)) -> Mission:
     """Start the simulated UAV (sim.uav) for an approved plan; report -> uav_dispatched. SCRUM-33.
-    Mock: the flight runs from started_at for MOCK.mission_duration_s and is computed on read."""
+    Mock: the flight runs from started_at and is computed on read from the mission's start state."""
+    sync_active_missions(db)
     mission = _mission(db, mission_id)
     if mission.state != MissionState.pending:
         raise conflict(f"Mission {mission_id} is {mission.state.value}; only a pending mission can be dispatched")
@@ -77,8 +87,13 @@ def dispatch_mission(mission_id: int, db: Session = Depends(get_db)) -> Mission:
         raise conflict(f"Flight plan {mission.flight_plan_id} is not approved")
     if mission.report.status != ReportStatus.under_review:
         raise conflict(f"Report {mission.report_id} is {mission.report.status.value}; it cannot be surveyed")
+    now = now_utc()
+    drone = get_drone_state(db, mission.flight_plan.drone_id, now)
+    if drone.status != DroneStatus.idle:
+        raise conflict(f"Drone {drone.drone_id} is {drone.status.value} and cannot be dispatched")
+    record_mission_start(db, mission, MissionStart(drone.lat, drone.lon, drone.altitude_m, drone.battery_pct))
     mission.state = MissionState.takeoff
-    mission.started_at = now_utc()
+    mission.started_at = now
     mission.report.status = ReportStatus.uav_dispatched
     db.commit()
     db.refresh(mission)
@@ -95,6 +110,20 @@ def push_telemetry(mission_id: int, body: TelemetryIn, db: Session = Depends(get
         raise conflict(f"Mission {mission_id} is {mission.state.value}; telemetry is taken only while it is flying")
     now = now_utc()
     return store_sample(db, mission, external_sample(mission, body, now), source="api", ts=now)
+
+
+def _mission_sample(db: Session, mission: Mission, elapsed_s: float) -> dict:
+    plan = mission.flight_plan
+    m_start = get_mission_start(db, mission)
+    sample = telemetry_at(
+        plan.route,
+        elapsed_s,
+        plan.drone_id,
+        mission_home(),
+        start_battery_pct=m_start.battery_pct,
+        start_pos=m_start.pos,
+    )
+    return TelemetryIn.model_validate(sample).model_dump()
 
 
 def current_telemetry(db: Session, mission: Mission) -> UavTelemetry:
@@ -124,17 +153,17 @@ def current_telemetry(db: Session, mission: Mission) -> UavTelemetry:
                 return newest
             if newest.source == "sim" and newest.state in FLYING_STATES and age < UAV.telemetry_interval_s:
                 return newest
-        return store_sample(db, mission, simulated_sample(mission, mission_elapsed_s(mission, now)), "sim", now)
+        return store_sample(db, mission, _mission_sample(db, mission, mission_elapsed_s(mission, now)), "sim", now)
 
     if mission.state == MissionState.done:
         if newest is not None:
             return newest
-        sample = simulated_sample(mission, mission_duration_s(mission))
+        sample = _mission_sample(db, mission, mission_duration_s(mission))
         return store_sample(db, mission, sample, "sim", mission.finished_at or now)
 
     if newest is not None:
         return newest
-    sample = simulated_sample(mission, 0.0)  # on the ground at home
+    sample = _mission_sample(db, mission, 0.0)  # on the ground at start
     sample.update(state=mission.state, in_mission=False)
     return store_sample(db, mission, sample, "sim", now)
 
@@ -157,6 +186,7 @@ def upload_results(mission_id: int, body: MissionResultsIn, db: Session = Depend
     if not complete_mission(db, mission, now_utc(), [d.model_dump() for d in body.detections]):
         raise conflict(f"Mission {mission_id} already has results")
     return mission
+
 
 
 @router.get("/{mission_id}/detections", response_model=list[DetectionOut])

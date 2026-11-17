@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -10,15 +10,34 @@ from app.db import get_db
 from app.models import FlightPlan, Mission, MissionState, PlanStatus, Report, ReportStatus
 from app.routers.common import conflict, get_or_404, now_utc
 from app.schemas import FlightPlanOut, PlanDecision
-from app.services.flight_planner import FlightPlanner
+from app.services.fleet import DroneStatus, get_drone_state, select_drone_for_target
+from app.services.flight_planner import FlightPlanner, OutOfServiceAreaError
 
 router = APIRouter(tags=["flight-plans"])
 
 _ACTIVE_PLAN = (PlanStatus.proposed, PlanStatus.approved)
 
 
-def _new_plan(report: Report, previous_reason: str | None = None) -> FlightPlan:
-    proposal = FlightPlanner().propose(report.lat, report.lon, previous_reason=previous_reason)
+def _new_plan(
+    db: Session,
+    report: Report,
+    previous_reason: str | None = None,
+    drone_id: str | None = None,
+) -> FlightPlan:
+    drone = get_drone_state(db, drone_id) if drone_id else None
+    if drone is None or drone.status != DroneStatus.idle:
+        drone = select_drone_for_target(db, report.lat, report.lon)
+    try:
+        proposal = FlightPlanner().propose(
+            report.lat,
+            report.lon,
+            previous_reason=previous_reason,
+            drone_id=drone.drone_id if drone else None,
+            start_pos=drone.position if drone else None,
+            start_battery_pct=drone.battery_pct if drone else None,
+        )
+    except OutOfServiceAreaError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return FlightPlan(
         report_id=report.id,
         drone_id=proposal.drone_id,
@@ -48,7 +67,7 @@ def propose_flight_plan(report_id: int, db: Session = Depends(get_db)) -> Flight
     active = next((p for p in reversed(report.flight_plans) if p.status in _ACTIVE_PLAN), None)
     if active is not None:
         raise conflict(f"Report {report_id} already has flight plan {active.id} ({active.status.value})")
-    plan = _new_plan(report)
+    plan = _new_plan(db, report)
     db.add(plan)
     db.commit()
     db.refresh(plan)
@@ -109,7 +128,7 @@ def request_changes(plan_id: int, body: PlanDecision, db: Session = Depends(get_
     plan.status = PlanStatus.changes_needed
     plan.decision_reason = body.reason
     plan.decided_at = now_utc()
-    new_plan = _new_plan(plan.report, previous_reason=body.reason)
+    new_plan = _new_plan(db, plan.report, previous_reason=body.reason, drone_id=plan.drone_id)
     db.add(new_plan)
     db.commit()
     db.refresh(new_plan)

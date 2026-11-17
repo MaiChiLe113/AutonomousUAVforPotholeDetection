@@ -5,14 +5,18 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
-from config import ENERGY, MOCK, UAV, EnergyConfig, MockConfig, UavConfig
-from sim.energy import bearing_deg, destination, estimate
+from config import ENERGY, FLEET, MOCK, UAV, EnergyConfig, FleetConfig, MockConfig, UavConfig
+from sim.energy import bearing_deg, destination, estimate, haversine_m
 
 # Words in the monitor's change request that set the direction of the change (otherwise a stable hash does).
 _LOWER = ("lower", "descend", "closer", "too high")
 _HIGHER = ("higher", "raise", "climb", "too low")
 _SMALLER = ("smaller", "tighter", "narrow", "too wide", "too big")
 _WIDER = ("wider", "larger", "bigger", "too small", "too narrow")
+
+
+class OutOfServiceAreaError(ValueError):
+    """Target lies outside the district fleet's configured service radius."""
 
 
 @dataclass
@@ -45,10 +49,17 @@ def _replan_factors(reason: str, step_pct: float) -> tuple[float, float]:
 
 
 class FlightPlanner:
-    def __init__(self, cfg: UavConfig = UAV, mock: MockConfig = MOCK, energy: EnergyConfig = ENERGY) -> None:
+    def __init__(
+        self,
+        cfg: UavConfig = UAV,
+        mock: MockConfig = MOCK,
+        energy: EnergyConfig = ENERGY,
+        fleet: FleetConfig = FLEET,
+    ) -> None:
         self.cfg = cfg
         self.mock = mock
         self.energy = energy
+        self.fleet = fleet
 
     def propose(
         self,
@@ -62,15 +73,26 @@ class FlightPlanner:
         return_to_home: bool = True,
     ) -> ProposedPlan:
         """Build a survey route and energy/time estimate for a target pin."""
+        home = (
+            (self.cfg.home_lat, self.cfg.home_lon)
+            if self.fleet is FLEET
+            else (self.fleet.base_lat, self.fleet.base_lon)
+        )
+        target = (float(target_lat), float(target_lon))
+        dist_from_base_m = haversine_m(home, target)
+        if dist_from_base_m > self.fleet.service_radius_m + 1e-3:
+            raise OutOfServiceAreaError(
+                f"Target ({target_lat:.5f}, {target_lon:.5f}) is {dist_from_base_m:.0f} m from base, "
+                f"outside the {self.fleet.service_radius_m:.0f} m service area"
+            )
+
         altitude = self.cfg.default_altitude_m
         radius = self.cfg.survey_radius_m
         if previous_reason and previous_reason.strip():
             alt_factor, rad_factor = _replan_factors(previous_reason, self.mock.replan_step_pct)
             altitude, radius = round(altitude * alt_factor, 1), round(radius * rad_factor, 1)
 
-        home = (self.cfg.home_lat, self.cfg.home_lon)
-        target = (float(target_lat), float(target_lon))
-        chosen_drone = drone_id or self.cfg.drone_ids[0]
+        chosen_drone = drone_id or self.fleet.drone_ids[0]
         start_bat = float(self.energy.full_battery_pct if start_battery_pct is None else start_battery_pct)
         if start_pos is None:
             origin = home

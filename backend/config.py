@@ -193,7 +193,7 @@ class UavConfig:
     camera_resolution: tuple[int, int] = (1920, 1080)
     frame_interval_s: float = 1.0
     telemetry_interval_s: float = 1.0
-    drone_ids: tuple[str, ...] = ("sim-uav-1",)
+    drone_ids: tuple[str, ...] = ("sim-uav-1", "sim-uav-2", "sim-uav-3")
     merge_radius_m: float = 2.0  # detections closer than this are one defect
 
 
@@ -219,6 +219,20 @@ class EnergyConfig:
     full_battery_pct: float = 100.0
     survey_dwell_s: float = 0.0  # extra simulated seconds per survey waypoint (for edge inference)
     time_scale: float = 15.0  # sim_seconds = wall_seconds * time_scale (10 min flight = 40 wall s)
+
+
+# ---------------------------------------------------------------------------
+# Fleet state and service area (docs/fleet-plan.md §1, §7 Phase 2)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class FleetConfig:
+    """District fleet parameters (docs/fleet-plan.md §1, §7 Phase 2-3)."""
+
+    drone_ids: tuple[str, ...] = ("sim-uav-1", "sim-uav-2", "sim-uav-3")
+    base_lat: float = 10.7769
+    base_lon: float = 106.7009
+    base_alt_m: float = 0.0
+    service_radius_m: float = 2_000.0
 
 
 # ---------------------------------------------------------------------------
@@ -288,5 +302,6 @@ MLOPS = MlopsConfig()
 MONITOR = MonitorConfig()
 UAV = UavConfig()
 ENERGY = EnergyConfig()
+FLEET = FleetConfig()
 API = ApiConfig()
 MOCK = MockConfig()

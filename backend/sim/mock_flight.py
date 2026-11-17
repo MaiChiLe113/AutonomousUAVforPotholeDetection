@@ -5,40 +5,42 @@ same output, so the API can recompute the UAV state from the mission start time 
 
 Route format (same as `schemas.Waypoint` and `FlightPlanner.propose`): a list of
 `{"lat", "lon", "alt", "action"}` with action "takeoff" | "fly" | "survey" | "land". `alt` is the height
-in metres above home. The planner builds: takeoff at home -> fly to target -> survey circle -> fly home -> land.
+in metres above home. Routes may start on the ground at home or in the air (chained missions).
 
-Target: the centre of the "survey" waypoints (mean lat/lon). If the route has no survey waypoints, the
-first "fly" waypoint; if it has none either, the last waypoint. See `route_target`.
-
-Timeline of one flight (`flight_duration_s` = `MOCK.mission_duration_s`). The route is split into legs:
-the first leg climbs from the ground at waypoint 0 to waypoint 0's altitude, then each leg flies to the next
-waypoint (and, if the route does not end on the ground, a last leg descends there). Each leg belongs to one
-phase, and each phase gets a share of the duration from `MOCK.flight_phase_shares`:
-
-    phase      legs                                state        gimbal pitch
-    climb      first leg (vertical, at takeoff)    "takeoff"    MOCK.gimbal_transit_pitch_deg
-    outbound   "fly" legs before the first survey  "takeoff"    MOCK.gimbal_transit_pitch_deg
-    survey     legs that end on a survey waypoint  "surveying"  MOCK.gimbal_survey_pitch_deg
-    return     "fly" legs after the last survey    "landing"    MOCK.gimbal_transit_pitch_deg
-    descent    the "land" leg                      "landing"    MOCK.gimbal_transit_pitch_deg
-
-So "takeoff" covers the climb (first 10% with the default shares) and the transit to the target; "landing"
-covers the return transit and the descent (last 10%). With this mapping the camera points straight down
-exactly when the state is "surveying". A phase the route does not have gives its share to the others.
-Inside a phase, time is split between legs by leg length. After the duration the state is "done".
+Timeline and battery drain come from `sim.energy.estimate`, so flight estimates and simulated
+telemetry always share the exact same timing and battery calculations in simulated seconds.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import replace
 
-from config import DATA, MOCK, UAV, MockConfig, UavConfig
+from config import DATA, ENERGY, MOCK, UAV, EnergyConfig, MockConfig, UavConfig
+from sim.energy import (
+    EARTH_RADIUS_M,
+    TimedLeg,
+    bearing_deg,
+    destination,
+    estimate,
+    haversine_m,
+    route_target,
+)
 
-EARTH_RADIUS_M = 6_371_000.0
+__all__ = [
+    "EARTH_RADIUS_M",
+    "bearing_deg",
+    "destination",
+    "edge_results",
+    "flight_duration_s",
+    "haversine_m",
+    "route_target",
+    "telemetry_at",
+]
 
-_PHASES = ("climb", "outbound", "survey", "return", "descent")
+_Leg = TimedLeg
+
 _PHASE_STATE = {
     "climb": "takeoff",
     "outbound": "takeoff",
@@ -49,117 +51,32 @@ _PHASE_STATE = {
 
 
 # ---------------------------------------------------------------------------
-# Geometry
-# ---------------------------------------------------------------------------
-def haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
-    """Great-circle distance in metres between two (lat, lon) points in degrees."""
-    lat1, lon1, lat2, lon2 = map(math.radians, (a[0], a[1], b[0], b[1]))
-    h = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
-    return 2 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(h)))
-
-
-def bearing_deg(a: tuple[float, float], b: tuple[float, float]) -> float:
-    """Initial bearing from a to b, degrees clockwise from north, in [0, 360)."""
-    lat1, lon1, lat2, lon2 = map(math.radians, (a[0], a[1], b[0], b[1]))
-    dlon = lon2 - lon1
-    x = math.sin(dlon) * math.cos(lat2)
-    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
-    return math.degrees(math.atan2(x, y)) % 360.0
-
-
-def destination(origin: tuple[float, float], bearing: float, distance_m: float) -> tuple[float, float]:
-    """The (lat, lon) reached from `origin` after `distance_m` metres on `bearing` degrees."""
-    lat1, lon1 = math.radians(origin[0]), math.radians(origin[1])
-    brg, d = math.radians(bearing), distance_m / EARTH_RADIUS_M
-    lat2 = math.asin(math.sin(lat1) * math.cos(d) + math.cos(lat1) * math.sin(d) * math.cos(brg))
-    y = math.sin(brg) * math.sin(d) * math.cos(lat1)
-    x = math.cos(d) - math.sin(lat1) * math.sin(lat2)
-    lon2 = lon1 + math.atan2(y, x)
-    return math.degrees(lat2), (math.degrees(lon2) + 540.0) % 360.0 - 180.0
-
-
-def route_target(route: list[dict]) -> tuple[float, float]:
-    """The surveyed point of a route: mean of the survey waypoints, else the first "fly" waypoint,
-    else the last waypoint."""
-    if not route:
-        raise ValueError("route is empty")
-    survey = [wp for wp in route if wp.get("action") == "survey"]
-    if survey:
-        return sum(wp["lat"] for wp in survey) / len(survey), sum(wp["lon"] for wp in survey) / len(survey)
-    fly = next((wp for wp in route if wp.get("action") == "fly"), route[-1])
-    return fly["lat"], fly["lon"]
-
-
-# ---------------------------------------------------------------------------
 # Timeline
 # ---------------------------------------------------------------------------
-@dataclass(frozen=True)
-class _Leg:
-    start: tuple[float, float, float]  # lat, lon, alt above home
-    end: tuple[float, float, float]
-    waypoint: int  # route index the leg flies to
-    phase: str
-    length_m: float  # 3D length
-    heading: float
-    t0: float = 0.0
-    t1: float = 0.0
+def _legs(
+    route: list[dict],
+    duration_s: float | None = None,
+    cfg: MockConfig = MOCK,
+    *,
+    start_battery_pct: float = ENERGY.full_battery_pct,
+    start_pos: tuple[float, float] | tuple[float, float, float] | None = None,
+    energy_cfg: EnergyConfig = ENERGY,
+) -> list[TimedLeg]:
+    """Split the route into timed legs using `sim.energy.estimate`."""
+    del duration_s, cfg  # kept for backwards compatibility with earlier callers
+    return estimate(route, start_battery_pct, start_pos=start_pos, cfg=energy_cfg).legs
 
 
-def _phase_of(index: int, action: str, first_survey: int | None) -> str:
-    if index == 0 or action == "takeoff":
-        return "climb"
-    if action == "land":
-        return "descent"
-    if action == "survey":
-        return "survey"
-    return "outbound" if first_survey is None or index < first_survey else "return"
-
-
-def _legs(route: list[dict], duration_s: float, cfg: MockConfig) -> list[_Leg]:
-    """Split the route into timed legs (see the module docstring)."""
-    if not route:
-        raise ValueError("route is empty")
-    first_survey = next((i for i, wp in enumerate(route) if wp.get("action") == "survey"), None)
-
-    raw: list[tuple[tuple[float, float, float], tuple[float, float, float], int, str]] = []
-    prev = (route[0]["lat"], route[0]["lon"], 0.0)  # on the ground at the takeoff point
-    for i, wp in enumerate(route):
-        point = (wp["lat"], wp["lon"], float(wp["alt"]))
-        raw.append((prev, point, i, _phase_of(i, wp.get("action", "fly"), first_survey)))
-        prev = point
-    if prev[2] > 0:  # route ends in the air: descend where it ends
-        raw.append((prev, (prev[0], prev[1], 0.0), len(route) - 1, "descent"))
-
-    # Heading per leg; vertical legs keep the previous heading (legs before the first move take the first one).
-    horiz = [haversine_m(s[:2], e[:2]) for s, e, _, _ in raw]
-    moving = [bearing_deg(s[:2], e[:2]) for (s, e, _, _), h in zip(raw, horiz, strict=True) if h > 0]
-    heading = moving[0] if moving else 0.0
-    headings = []
-    for (s, e, _, _), h in zip(raw, horiz, strict=True):
-        heading = bearing_deg(s[:2], e[:2]) if h > 0 else heading
-        headings.append(heading)
-
-    # Time: each phase gets its share (re-normalised over the phases present), split by leg length.
-    lengths = [math.hypot(h, e[2] - s[2]) for (s, e, _, _), h in zip(raw, horiz, strict=True)]
-    phases = [phase for _, _, _, phase in raw]
-    shares = dict(zip(_PHASES, cfg.flight_phase_shares, strict=True))
-    share_total = sum(shares[p] for p in set(phases)) or 1.0
-    phase_len = {p: sum(n for n, q in zip(lengths, phases, strict=True) if q == p) for p in set(phases)}
-
-    legs: list[_Leg] = []
-    t = 0.0
-    for (start, end, index, phase), length, heading in zip(raw, lengths, headings, strict=True):
-        part = length / phase_len[phase] if phase_len[phase] > 0 else 1 / phases.count(phase)
-        dt = duration_s * shares[phase] / share_total * part
-        legs.append(_Leg(start, end, index, phase, length, heading, t, t + dt))
-        t += dt
-    return legs
-
-
-def flight_duration_s(route: list[dict], cfg: MockConfig = MOCK) -> float:
-    """Seconds from dispatch to touchdown. Fixed by `cfg.mission_duration_s` (time-compressed demo flight);
-    `route` is accepted so a distance-based duration can replace it later without changing callers."""
-    return float(cfg.mission_duration_s)
+def flight_duration_s(
+    route: list[dict],
+    cfg: MockConfig = MOCK,
+    *,
+    start_pos: tuple[float, float] | tuple[float, float, float] | None = None,
+    energy_cfg: EnergyConfig = ENERGY,
+) -> float:
+    """Simulated flight duration in seconds from `sim.energy.estimate`."""
+    del cfg
+    return estimate(route, start_pos=start_pos, cfg=energy_cfg).duration_s
 
 
 def telemetry_at(
@@ -168,25 +85,35 @@ def telemetry_at(
     drone_id: str,
     home: tuple[float, float, float],
     cfg: MockConfig = MOCK,
+    *,
+    start_battery_pct: float = ENERGY.full_battery_pct,
+    start_pos: tuple[float, float] | tuple[float, float, float] | None = None,
+    energy_cfg: EnergyConfig = ENERGY,
+    time_scale: float | None = None,
 ) -> dict:
-    """UAV telemetry `elapsed_s` seconds after dispatch, using the internal snake_case field names.
+    """UAV telemetry `elapsed_s` simulated seconds after dispatch (internal snake_case fields).
 
     `home` is (lat, lon, alt_m). `elapsed_s` is clamped to [0, duration]. State and gimbal follow the phase
-    table in the module docstring. `altitude_m` is height above home. `current_waypoint` is the 0-based route
-    index the UAV is flying to (the last index once done). Distances are horizontal (haversine) metres.
-    Battery drains linearly from `cfg.battery_start_pct` to `cfg.battery_end_pct` over the flight.
+    table. `altitude_m` is height above home. `current_waypoint` is the 0-based route index the UAV is
+    flying to (the last index once done). Distances are horizontal (haversine) metres.
+    Battery drains by phase rate from `sim.energy.estimate`, starting from `start_battery_pct`.
     """
-    duration = flight_duration_s(route, cfg)
+    active_energy = replace(energy_cfg, time_scale=time_scale) if time_scale is not None else energy_cfg
+    est = estimate(route, start_battery_pct, start_pos=start_pos, cfg=active_energy)
+    duration = est.duration_s
+    legs = est.legs
     t = min(max(float(elapsed_s), 0.0), duration)
     done = t >= duration
-    legs = _legs(route, duration, cfg)
 
     if done:
         leg, frac = legs[-1], 1.0
+        battery = est.end_battery_pct
     else:
         leg = next((lg for lg in legs if t < lg.t1), legs[-1])
         span = leg.t1 - leg.t0
-        frac = (t - leg.t0) / span if span > 0 else 1.0
+        frac = min(1.0, max(0.0, (t - leg.t0) / span)) if span > 0 else 1.0
+        battery = round(leg.b0 + (leg.b1 - leg.b0) * frac, 2)
+
     lat = leg.start[0] + (leg.end[0] - leg.start[0]) * frac
     lon = leg.start[1] + (leg.end[1] - leg.start[1]) * frac
     alt = leg.start[2] + (leg.end[2] - leg.start[2]) * frac
@@ -194,7 +121,6 @@ def telemetry_at(
     progress = t / duration if duration > 0 else 1.0
     pitch = cfg.gimbal_survey_pitch_deg if leg.phase == "survey" and not done else cfg.gimbal_transit_pitch_deg
     heading = round(leg.heading % 360.0, 1)
-    battery = cfg.battery_start_pct + (cfg.battery_end_pct - cfg.battery_start_pct) * progress
 
     return {
         "lat": round(lat, 7),
@@ -211,7 +137,7 @@ def telemetry_at(
         "gimbal_pitch_deg": float(pitch),
         "gimbal_yaw_deg": heading,
         "gimbal_roll_deg": 0.0,  # stabilised gimbal
-        "battery_pct": round(battery, 1),
+        "battery_pct": battery,
         "in_mission": not done,
         "current_waypoint": leg.waypoint,
         "progress_pct": round(progress * 100.0, 1),

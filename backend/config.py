@@ -198,6 +198,30 @@ class UavConfig:
 
 
 # ---------------------------------------------------------------------------
+# Energy, battery and simulated clock (docs/fleet-plan.md §4)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class EnergyConfig:
+    """Reference drone: DJI Mavic 3 Enterprise (docs/fleet-plan.md §4)."""
+
+    battery_capacity_wh: float = 77.0
+    cruise_speed_mps: float = 9.0  # 32.4 km/h transit speed
+    survey_speed_mps: float = 5.0  # survey circle speed
+    climb_speed_mps: float = 3.0  # vertical climb speed
+    descent_speed_mps: float = 3.0  # vertical descent speed
+    max_speed_mps: float = 15.0  # normal-mode upper bound
+    cruise_endurance_min: float = 45.0  # 100 / 45 = 2.222... %/min before safety factor
+    hover_endurance_min: float = 38.0  # 100 / 38 = 2.631... %/min (hover, survey, climb, descent)
+    safety_factor: float = 1.25  # multiplies every battery drain estimate
+    reserve_pct: float = 25.0  # minimum battery required upon landing at base
+    swap_below_pct: float = 60.0  # swap battery at base only when landing below this level
+    swap_duration_s: float = 120.0  # simulated seconds for a battery swap at base
+    full_battery_pct: float = 100.0
+    survey_dwell_s: float = 0.0  # extra simulated seconds per survey waypoint (for edge inference)
+    time_scale: float = 15.0  # sim_seconds = wall_seconds * time_scale (10 min flight = 40 wall s)
+
+
+# ---------------------------------------------------------------------------
 # API server - SCRUM-23
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -263,5 +287,6 @@ PROMOTION = PromotionConfig()
 MLOPS = MlopsConfig()
 MONITOR = MonitorConfig()
 UAV = UavConfig()
+ENERGY = EnergyConfig()
 API = ApiConfig()
 MOCK = MockConfig()

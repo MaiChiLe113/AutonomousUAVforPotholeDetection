@@ -227,6 +227,7 @@ function FlightPlanReview() {
                 <Stat label="Survey radius" value={Math.round(plan.survey_radius_m)} unit="m" />
                 <Stat label="Route distance" value={formatDistance(plan.distance_m)} />
                 <Stat label="Estimated time" value={formatDuration(plan.estimated_duration_s)} />
+                <Stat label="Est. battery" value={plan.estimated_battery_pct.toFixed(1)} unit="%" />
               </StatGrid>
               <p className="mt-2 text-xs text-slate-500">
                 {plan.route.length} waypoints: takeoff at home, fly to the pothole, survey circle, return and land.

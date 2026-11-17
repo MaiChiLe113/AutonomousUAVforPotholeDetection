@@ -9,6 +9,7 @@ from sqlalchemy import JSON, Boolean, DateTime, Enum, Float, ForeignKey, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+from sim.energy import estimate
 from sim.mock_flight import flight_duration_s, haversine_m
 
 
@@ -169,8 +170,13 @@ class FlightPlan(Base):
 
     @property
     def estimated_duration_s(self) -> float:
-        """Same duration the mock flight uses (sim.mock_flight.flight_duration_s)."""
+        """Simulated flight duration in seconds from sim.energy.estimate."""
         return flight_duration_s(self.route)
+
+    @property
+    def estimated_battery_pct(self) -> float:
+        """Estimated battery percentage used by the route (sim.energy.estimate)."""
+        return estimate(self.route).battery_used_pct
 
 
 class Mission(Base):

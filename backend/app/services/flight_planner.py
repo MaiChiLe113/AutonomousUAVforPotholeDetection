@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
-from config import MOCK, UAV, MockConfig, UavConfig
-from sim.mock_flight import bearing_deg, destination
+from config import ENERGY, MOCK, UAV, EnergyConfig, MockConfig, UavConfig
+from sim.energy import bearing_deg, destination, estimate
 
 # Words in the monitor's change request that set the direction of the change (otherwise a stable hash does).
 _LOWER = ("lower", "descend", "closer", "too high")
@@ -21,6 +21,9 @@ class ProposedPlan:
     altitude_m: float
     survey_radius_m: float
     route: list[dict]  # [{"lat", "lon", "alt", "action"}], takeoff -> target -> survey -> land
+    estimated_duration_s: float = 0.0
+    estimated_battery_pct: float = 0.0
+    start_battery_pct: float = ENERGY.full_battery_pct
 
 
 def _direction(reason: str, down: tuple[str, ...], up: tuple[str, ...], bit: int) -> int:
@@ -42,23 +45,23 @@ def _replan_factors(reason: str, step_pct: float) -> tuple[float, float]:
 
 
 class FlightPlanner:
-    def __init__(self, cfg: UavConfig = UAV, mock: MockConfig = MOCK) -> None:
+    def __init__(self, cfg: UavConfig = UAV, mock: MockConfig = MOCK, energy: EnergyConfig = ENERGY) -> None:
         self.cfg = cfg
         self.mock = mock
+        self.energy = energy
 
-    def propose(self, target_lat: float, target_lon: float, previous_reason: str | None = None) -> ProposedPlan:
-        """Takeoff at home, fly to the pin, survey pattern of cfg.survey_radius_m, return and land.
-        `previous_reason` is the admin's change request, if any.
-
-        Route (12 waypoints with the default `survey_points` of 8):
-        takeoff at home (climb to altitude) -> fly to the target -> `survey_points` survey waypoints on a
-        circle of the survey radius around the target, clockwise, starting straight ahead of the approach ->
-        fly back above home -> land at home (alt 0). `alt` is metres above home.
-
-        With `previous_reason`, altitude and radius each change by 1-2 steps of `mock.replan_step_pct`,
-        decided by the reason text: words like "lower"/"higher" and "smaller"/"wider" set the direction,
-        otherwise a hash of the text does. The same reason always gives the same plan.
-        """
+    def propose(
+        self,
+        target_lat: float,
+        target_lon: float,
+        previous_reason: str | None = None,
+        *,
+        drone_id: str | None = None,
+        start_pos: tuple[float, float] | tuple[float, float, float] | None = None,
+        start_battery_pct: float | None = None,
+        return_to_home: bool = True,
+    ) -> ProposedPlan:
+        """Build a survey route and energy/time estimate for a target pin."""
         altitude = self.cfg.default_altitude_m
         radius = self.cfg.survey_radius_m
         if previous_reason and previous_reason.strip():
@@ -66,19 +69,46 @@ class FlightPlanner:
             altitude, radius = round(altitude * alt_factor, 1), round(radius * rad_factor, 1)
 
         home = (self.cfg.home_lat, self.cfg.home_lon)
-        target = (target_lat, target_lon)
-        start = bearing_deg(home, target) if home != target else 0.0
+        target = (float(target_lat), float(target_lon))
+        chosen_drone = drone_id or self.cfg.drone_ids[0]
+        start_bat = float(self.energy.full_battery_pct if start_battery_pct is None else start_battery_pct)
+        if start_pos is None:
+            origin = home
+            origin_alt = 0.0
+            in_air = False
+        else:
+            origin = (float(start_pos[0]), float(start_pos[1]))
+            origin_alt = float(start_pos[2]) if len(start_pos) == 3 else 0.0
+            in_air = origin_alt > 0.0
+
+        start = bearing_deg(origin, target) if origin != target else 0.0
         points = max(1, self.mock.survey_points)
 
+        first_wp = (
+            {"lat": origin[0], "lon": origin[1], "alt": origin_alt, "action": "fly"}
+            if in_air
+            else {"lat": origin[0], "lon": origin[1], "alt": altitude, "action": "takeoff"}
+        )
         route = [
-            {"lat": home[0], "lon": home[1], "alt": altitude, "action": "takeoff"},
-            {"lat": target_lat, "lon": target_lon, "alt": altitude, "action": "fly"},
+            first_wp,
+            {"lat": target[0], "lon": target[1], "alt": altitude, "action": "fly"},
         ]
         for k in range(points):
             lat, lon = destination(target, start + 360.0 * k / points, radius)
             route.append({"lat": round(lat, 7), "lon": round(lon, 7), "alt": altitude, "action": "survey"})
-        route += [
-            {"lat": home[0], "lon": home[1], "alt": altitude, "action": "fly"},
-            {"lat": home[0], "lon": home[1], "alt": 0.0, "action": "land"},
-        ]
-        return ProposedPlan(self.cfg.drone_ids[0], altitude, radius, route)
+        if return_to_home:
+            route += [
+                {"lat": home[0], "lon": home[1], "alt": altitude, "action": "fly"},
+                {"lat": home[0], "lon": home[1], "alt": 0.0, "action": "land"},
+            ]
+
+        est = estimate(route, start_battery_pct=start_bat, start_pos=start_pos, cfg=self.energy)
+        return ProposedPlan(
+            chosen_drone,
+            altitude,
+            radius,
+            route,
+            estimated_duration_s=est.duration_s,
+            estimated_battery_pct=est.battery_used_pct,
+            start_battery_pct=start_bat,
+        )

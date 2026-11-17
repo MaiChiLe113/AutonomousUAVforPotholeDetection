@@ -78,7 +78,8 @@ class FlightPlanOut(_Orm):
     created_at: datetime
     mission_id: int | None = None  # set once the plan is approved
     distance_m: float  # horizontal route length (sum of haversine legs)
-    estimated_duration_s: float  # same as the mock flight (MOCK.mission_duration_s)
+    estimated_duration_s: float  # simulated flight duration from sim.energy.estimate
+    estimated_battery_pct: float  # estimated battery percentage used
 
 
 class PlanDecision(BaseModel):

@@ -79,7 +79,8 @@ export interface FlightPlan {
   created_at: string;
   mission_id: number | null; // set once the plan is approved ("Launch UAV" = dispatchMission(mission_id))
   distance_m: number; // horizontal route length (sum of haversine legs)
-  estimated_duration_s: number; // mock flight time
+  estimated_duration_s: number; // simulated flight time (s)
+  estimated_battery_pct: number; // estimated battery used (%)
 }
 
 export interface PlanDecision {

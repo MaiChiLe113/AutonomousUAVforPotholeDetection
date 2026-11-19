@@ -19,6 +19,10 @@ const PATHS = {
     "M5 5h4M15 5h4M7 5v3M17 5v3M9 10h6v4H9zM7 8l2 2M17 8l-2 2M7 16l2-2M17 16l-2-2M7 16v3M17 16v3M5 19h4M15 19h4",
   refresh: "M20 11a8 8 0 0 0-14.9-3.9L4 9M4 4v5h5M4 13a8 8 0 0 0 14.9 3.9L20 15M20 20v-5h-5",
   plus: "M12 5v14M5 12h14",
+  play: "M7 4v16l13-8z",
+  list: "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
+  map: "M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2zM9 4v14M15 6v14",
+  history: "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 7v5l3 2",
   photo: "M4 5h16v14H4zM4 16l5-5 4 4 2-2 5 5M15.5 9.5h.01",
 } as const;
 

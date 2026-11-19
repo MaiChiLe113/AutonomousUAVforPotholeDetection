@@ -180,12 +180,20 @@ class MonitorConfig:
 
 
 # ---------------------------------------------------------------------------
+# Single source of the fleet identity and the base location (FleetConfig and UavConfig both read these)
+# ---------------------------------------------------------------------------
+_DRONE_IDS: tuple[str, ...] = ("sim-uav-1", "sim-uav-2", "sim-uav-3")
+_BASE_LAT = 10.7769
+_BASE_LON = 106.7009
+
+
+# ---------------------------------------------------------------------------
 # UAV simulation and flight planning (§2.1) - SCRUM-22, SCRUM-27, SCRUM-33
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class UavConfig:
-    home_lat: float = 10.7769  # TODO(SCRUM-22, Hoan): set the base location
-    home_lon: float = 106.7009
+    home_lat: float = _BASE_LAT  # derived from the fleet base (one source)
+    home_lon: float = _BASE_LON
     default_altitude_m: float = 30.0
     survey_radius_m: float = 25.0
     speed_mps: float = 5.0
@@ -193,7 +201,7 @@ class UavConfig:
     camera_resolution: tuple[int, int] = (1920, 1080)
     frame_interval_s: float = 1.0
     telemetry_interval_s: float = 1.0
-    drone_ids: tuple[str, ...] = ("sim-uav-1", "sim-uav-2", "sim-uav-3")
+    drone_ids: tuple[str, ...] = _DRONE_IDS  # derived from the fleet (one source)
     merge_radius_m: float = 2.0  # detections closer than this are one defect
 
 
@@ -218,7 +226,10 @@ class EnergyConfig:
     swap_duration_s: float = 120.0  # simulated seconds for a battery swap at base
     full_battery_pct: float = 100.0
     survey_dwell_s: float = 0.0  # extra simulated seconds per survey waypoint (for edge inference)
-    time_scale: float = 15.0  # sim_seconds = wall_seconds * time_scale (10 min flight = 40 wall s)
+    time_scale: float = float(_env("SIM_TIME_SCALE", "15"))  # sim_seconds = wall_seconds * time_scale (tests: 1)
+    time_epsilon_s: float = 1e-3  # simulated seconds of tolerance when comparing elapsed time with a duration
+    wind_mps: float = 0.0  # headwind-equivalent wind used for drain estimates (0 = calm, existing behaviour)
+    wind_drain_per_mps: float = 0.03  # extra drain fraction per m/s of wind: drain *= 1 + k * wind_mps
 
 
 # ---------------------------------------------------------------------------
@@ -228,17 +239,61 @@ class EnergyConfig:
 class FleetConfig:
     """District fleet parameters (docs/fleet-plan.md §1, §7 Phase 2-3)."""
 
-    drone_ids: tuple[str, ...] = ("sim-uav-1", "sim-uav-2", "sim-uav-3")
-    base_lat: float = 10.7769
-    base_lon: float = 106.7009
+    drone_ids: tuple[str, ...] = _DRONE_IDS
+    district_name: str = "District 1, Ho Chi Minh City"
+    base_lat: float = _BASE_LAT
+    base_lon: float = _BASE_LON
     base_alt_m: float = 0.0
     service_radius_m: float = 2_000.0
+    area_epsilon_m: float = 1e-3  # tolerance when testing a target against the service radius
     report_merge_radius_m: float = 15.0  # reports closer than this join an open task
     max_task_retries: int = 1  # requeue once on edge failure, then flag for monitor
     allocator: str = "baseline"  # "baseline" | "auction" | "insertion"
     multi_stop_radius_m: float = 400.0  # nearby tasks within this radius can share one multi-stop plan
     max_stops_per_plan: int = 3  # maximum targets visited in a single flight plan
     re_tasking: bool = False  # enable mid-leg / mid-return insertion when using auction/insertion
+    auto_tick: bool = _env("AUTO_TICK", "1") != "0"  # background dispatcher loop in the API (tests set AUTO_TICK=0)
+    tick_interval_s: float = 2.0  # wall seconds between background dispatch ticks
+
+
+# ---------------------------------------------------------------------------
+# Flight safety: go / no-go gate, priority, decision log (docs/fleet-plan.md, district plan)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class SafetyConfig:
+    """Thresholds the drones use to decide whether to fly. Demo values (a Mavic 3 resists about 12 m/s)."""
+
+    enabled: bool = True
+    max_wind_mps: float = 8.0  # no launch above this mean wind
+    max_gust_mps: float = 12.0  # no launch above this gust
+    rain_blocks_flight: bool = True
+    min_launch_battery_pct: float = 30.0  # a drone below this stays on the ground
+    mid_flight_recall: bool = True  # recall flying drones when the weather turns bad
+    recall_wind_margin_mps: float = 2.0  # recall only above the launch limit plus this margin (hysteresis)
+    priority_by_severity: dict[str, int] = field(
+        default_factory=lambda: {"D40": 3, "D20": 2, "D10": 1, "D00": 1}  # pothole > alligator > cracks
+    )
+    priority_default: int = 1  # report without server detections
+    priority_confidence_min: float = 0.8  # a detection at or above this confidence raises the priority
+    priority_confidence_bonus: int = 1
+    decision_log_max: int = 50  # newest decisions kept in AppMeta and returned by GET /fleet
+    queue_recent_closed: int = 5  # closed tasks (completed / cancelled) still listed by GET /fleet
+
+
+# ---------------------------------------------------------------------------
+# Simulated weather (clearly labelled simulated; the same interface can take a real feed later)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class WeatherConfig:
+    enabled: bool = _env("SIM_WEATHER", "1") != "0"  # False: always calm (tests set SIM_WEATHER=0)
+    seed: int = 7
+    period_s: float = 240.0  # wall seconds per weather cycle
+    step_s: float = 20.0  # wall seconds between calm-weather changes
+    calm_wind_mps: tuple[float, float] = (1.0, 5.0)
+    gust_extra_mps: tuple[float, float] = (1.0, 4.0)  # gust = wind + a value in this range
+    storm_windows: tuple[tuple[float, float], ...] = ((0.0, 0.25),)  # (start, end) as fractions of the period
+    storm_wind_mps: tuple[float, float] = (9.5, 13.0)
+    rain_windows: tuple[tuple[float, float], ...] = ((0.55, 0.70),)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +345,8 @@ class ApiConfig:
     port: int = 8000
     max_upload_mb: int = 10
     allowed_types: tuple[str, ...] = ("image/jpeg", "image/png")
+    role_header: str = "X-Role"  # demo-grade role check, NOT real authentication
+    monitor_role: str = "monitor"  # only this role may dispatch, recall, cancel, review and reset
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +404,8 @@ MONITOR = MonitorConfig()
 UAV = UavConfig()
 ENERGY = EnergyConfig()
 FLEET = FleetConfig()
+SAFETY = SafetyConfig()
+WEATHER = WeatherConfig()
 SCENARIOS = ScenarioConfig()
 EDGE_WORKER = EdgeWorkerConfig()
 API = ApiConfig()

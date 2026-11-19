@@ -8,7 +8,7 @@ even when nobody watches the dashboard (SCRUM-33, SCRUM-34, SCRUM-39).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import TypeVar
 
 from fastapi import HTTPException
@@ -17,7 +17,8 @@ from sqlalchemy.orm import Session
 
 from app.models import FLYING_STATES, Detection, Mission, MissionState, ReportStatus, UavTelemetry
 from app.schemas import TelemetryIn
-from config import MOCK, UAV
+from app.services.simclock import sim_delta, sim_elapsed_s
+from config import ENERGY, MOCK, UAV
 from sim.mock_flight import edge_results, flight_duration_s, haversine_m, telemetry_at
 
 T = TypeVar("T")
@@ -55,7 +56,8 @@ def mission_duration_s(mission: Mission) -> float:
 
 
 def mission_elapsed_s(mission: Mission, now: datetime) -> float:
-    return seconds_between(mission.started_at, now) if mission.started_at else 0.0
+    """Simulated seconds since dispatch (wall-clock time x ENERGY.time_scale)."""
+    return sim_elapsed_s(mission.started_at, now, ENERGY) if mission.started_at else 0.0
 
 
 def simulated_sample(mission: Mission, elapsed_s: float) -> dict:
@@ -149,7 +151,7 @@ def sync_mission(db: Session, mission: Mission, now: datetime | None = None) -> 
     duration = mission_duration_s(mission)
     elapsed = mission_elapsed_s(mission, now)
 
-    if elapsed >= duration:
+    if elapsed >= duration - ENERGY.time_epsilon_s:
         report = mission.report
         server = [
             {
@@ -162,7 +164,7 @@ def sync_mission(db: Session, mission: Mission, now: datetime | None = None) -> 
             for d in report.detections
         ]
         edge = edge_results(server, (report.lat, report.lon), altitude_m=mission.flight_plan.altitude_m)
-        complete_mission(db, mission, mission.started_at + timedelta(seconds=duration), edge)
+        complete_mission(db, mission, mission.started_at + sim_delta(duration, ENERGY), edge)
         return mission
 
     state = MissionState(telemetry_at(mission.flight_plan.route, elapsed, mission.drone_id, mission_home())["state"])

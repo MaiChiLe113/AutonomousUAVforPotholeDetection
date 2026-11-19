@@ -23,6 +23,7 @@ from app.models import (
     ReportStatus,
     UavTelemetry,
 )
+from app.routers.auth import require_monitor
 from app.routers.common import (
     complete_mission,
     conflict,
@@ -79,7 +80,7 @@ def get_mission(mission_id: int, db: Session = Depends(get_db)) -> Mission:
     return _mission(db, mission_id)
 
 
-@router.post("/{mission_id}/dispatch", response_model=MissionOut)
+@router.post("/{mission_id}/dispatch", response_model=MissionOut, dependencies=[Depends(require_monitor)])
 def dispatch_mission(mission_id: int, db: Session = Depends(get_db)) -> Mission:
     """Start the simulated UAV (sim.uav) for an approved plan; report -> uav_dispatched. SCRUM-33.
     Mock: the flight runs from started_at and is computed on read from the mission's start state."""
@@ -104,6 +105,7 @@ def dispatch_mission(mission_id: int, db: Session = Depends(get_db)) -> Mission:
     return mission
 
 
+# Not role-guarded on purpose: the simulator / drone app pushes telemetry and has no monitor role.
 @router.post("/{mission_id}/telemetry", response_model=TelemetryOut, status_code=201)
 def push_telemetry(mission_id: int, body: TelemetryIn, db: Session = Depends(get_db)) -> UavTelemetry:
     """Called by the simulator every config.UAV.telemetry_interval_s. SCRUM-33.
@@ -179,6 +181,7 @@ def latest_telemetry(mission_id: int, db: Session = Depends(get_db)) -> UavTelem
     return current_telemetry(db, get_or_404(db, Mission, mission_id, "Mission"))
 
 
+# Not role-guarded on purpose: the edge device uploads results and has no monitor role.
 @router.post("/{mission_id}/results", response_model=MissionOut)
 def upload_results(mission_id: int, body: MissionResultsIn, db: Session = Depends(get_db)) -> Mission:
     """Edge detections after landing: geo-locate (ml.geo), merge repeats, store,
@@ -193,7 +196,7 @@ def upload_results(mission_id: int, body: MissionResultsIn, db: Session = Depend
     return mission
 
 
-@router.post("/{mission_id}/recall", response_model=MissionOut)
+@router.post("/{mission_id}/recall", response_model=MissionOut, dependencies=[Depends(require_monitor)])
 def recall_flying_mission(
     mission_id: int,
     body: PlanDecision | None = None,
@@ -239,7 +242,9 @@ def _idle(mission: Mission) -> CameraSessionOut:
     return CameraSessionOut(mission_id=mission.id, status=CameraStatus.idle)
 
 
-@router.post("/{mission_id}/camera/request", response_model=CameraSessionOut)
+@router.post(
+    "/{mission_id}/camera/request", response_model=CameraSessionOut, dependencies=[Depends(require_monitor)]
+)
 def request_camera(mission_id: int, db: Session = Depends(get_db)) -> CameraSession | CameraSessionOut:
     """Ask the UAV for its live camera. While the mission is takeoff, surveying or landing: "requested"
     (then "live" after MOCK.camera_live_delay_s). Otherwise 200 with status "denied"; the denial is not
@@ -270,7 +275,7 @@ def get_camera(mission_id: int, db: Session = Depends(get_db)) -> CameraSession 
     return _camera(db, mission) or _idle(mission)
 
 
-@router.post("/{mission_id}/camera/stop", response_model=CameraSessionOut)
+@router.post("/{mission_id}/camera/stop", response_model=CameraSessionOut, dependencies=[Depends(require_monitor)])
 def stop_camera(mission_id: int, db: Session = Depends(get_db)) -> CameraSession | CameraSessionOut:
     """End the live camera. Stopping an ended session returns it unchanged; never requested -> idle."""
     mission = _mission(db, mission_id)

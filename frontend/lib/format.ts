@@ -1,6 +1,16 @@
 // Display helpers shared by every page.
 
-import { CAMERA_STATUS, CLASS_LABELS, MISSION_STATE, PLAN_STATUS, REPORT_STATUS, type StatusStyle } from "./config";
+import {
+  CAMERA_STATUS,
+  CLASS_LABELS,
+  DECISION_ACTION,
+  DRONE_STATUS,
+  MISSION_STATE,
+  PLAN_STATUS,
+  REPORT_STATUS,
+  TASK_STATUS,
+  type StatusStyle,
+} from "./config";
 
 /**
  * Parse a backend datetime. The API sends timezone-aware UTC times ("2026-11-04T10:00:00Z" or "+00:00").
@@ -63,6 +73,14 @@ export function formatDuration(seconds: number | null | undefined): string {
   return m % 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${Math.floor(m / 60)} h`;
 }
 
+/** Seconds until `iso` as "42 s" / "1 min 5 s"; "now" once it has passed; "–" when unknown. */
+export function countdownTo(iso: string | null | undefined, nowMs: number): string {
+  const d = parseApiDate(iso);
+  if (!d) return "–";
+  const s = Math.ceil((d.getTime() - nowMs) / 1000);
+  return s <= 0 ? "now" : formatDuration(s);
+}
+
 /** 268.4 -> "268°", -30 -> "-30°". */
 export const formatDeg = (x: number | null | undefined) => (x == null || !Number.isFinite(x) ? "–" : `${Math.round(x)}°`);
 
@@ -76,21 +94,24 @@ export function compassPoint(deg: number): string {
 /** "D40" -> "Pothole". */
 export const classLabel = (cls: string) => CLASS_LABELS[cls] ?? cls;
 
-export type StatusKind = "report" | "plan" | "mission" | "camera";
+export type StatusKind = "report" | "plan" | "mission" | "camera" | "drone" | "task" | "decision";
 
 const TABLES: Record<StatusKind, Record<string, StatusStyle>> = {
   report: REPORT_STATUS,
   plan: PLAN_STATUS,
   mission: MISSION_STATE,
   camera: CAMERA_STATUS,
+  drone: DRONE_STATUS,
+  task: TASK_STATUS,
+  decision: DECISION_ACTION,
 };
 
 /**
  * Label and colours for any status. Without `kind` the tables are searched in the order
- * report, plan, mission, camera ("rejected" looks the same for reports and plans).
+ * report, plan, mission, camera, drone, task, decision ("rejected" looks the same for reports and plans).
  */
 export function statusStyle(status: string, kind?: StatusKind): StatusStyle {
-  const order: StatusKind[] = kind ? [kind] : ["report", "plan", "mission", "camera"];
+  const order: StatusKind[] = kind ? [kind] : ["report", "plan", "mission", "camera", "drone", "task", "decision"];
   for (const k of order) {
     const s = TABLES[k][status];
     if (s) return s;

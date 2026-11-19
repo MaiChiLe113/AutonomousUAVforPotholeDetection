@@ -1,6 +1,7 @@
 "use client";
 
-// UC-M1 report queue (SCRUM-23, SCRUM-29): every report as a status-coloured pin plus a filtered list.
+// UC-M1 report queue (SCRUM-23, SCRUM-29), the Reports tab: a filtered list on the left, the map with every
+// report as a status-coloured pin on the right (list above the map on narrow screens).
 // Selecting a row or a pin flies the map to it; "Open" goes to the review page. Refreshes every 10 s.
 
 import Link from "next/link";
@@ -10,7 +11,7 @@ import MapView, { type FlyTarget, type MapMarker } from "@/components/MapView";
 import { QUEUE_FILTERS, queueFilterOf, topDetection, type QueueFilter } from "@/components/monitor/queue";
 import RoleGate from "@/components/RoleGate";
 import StatusBadge from "@/components/StatusBadge";
-import { Banner, Chip, ChipRow, EmptyState, FloatingPanel, Icon, LoadingState } from "@/components/ui";
+import { Banner, Chip, ChipRow, EmptyState, Icon, LoadingState } from "@/components/ui";
 import { listReports } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { MONITOR, MONITOR_ROUTES, REPORT_STATUS, SIM } from "@/lib/config";
@@ -69,19 +70,15 @@ function ReportQueue() {
   const current = QUEUE_FILTERS.find((f) => f.value === filter)!;
 
   return (
-    <>
-      <MapView
-        markers={markers}
-        selectedId={selectedId}
-        onMarkerClick={onMarkerClick}
-        flyTo={fly}
-        // Fit the chip's pins once the data arrives and whenever the chip changes.
-        fitKey={reports ? filter : null}
-      />
-      <FloatingPanel
-        title="Report queue"
-        subtitle={reports ? `${reports.length} reports · refreshes every ${Math.round(SIM.reportQueuePollMs / 1000)} s` : "Loading reports…"}
-      >
+    <div className="absolute inset-0 flex flex-col md:flex-row">
+      <section aria-label="Report queue" className="flex max-h-[55%] min-h-0 shrink-0 flex-col border-b border-slate-200 bg-white md:max-h-none md:w-[420px] md:border-r md:border-b-0">
+        <header className="shrink-0 px-4 pt-4 pb-3">
+          <h1 className="text-lg leading-tight font-semibold text-slate-900">Report queue</h1>
+          <p className="mt-0.5 truncate text-sm text-slate-500">
+            {reports ? `${reports.length} reports · refreshes every ${Math.round(SIM.reportQueuePollMs / 1000)} s` : "Loading reports…"}
+          </p>
+        </header>
+        <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-4 pb-4">
         <ChipRow className="mb-3">
           {QUEUE_FILTERS.map((f) => (
             <Chip key={f.value} active={filter === f.value} count={reports ? counts[f.value] : undefined} onClick={() => setFilter(f.value)}>
@@ -108,8 +105,20 @@ function ReportQueue() {
             ))}
           </ul>
         )}
-      </FloatingPanel>
-    </>
+        </div>
+      </section>
+      <div className="relative min-h-0 min-w-0 flex-1">
+        <MapView
+          markers={markers}
+          selectedId={selectedId}
+          onMarkerClick={onMarkerClick}
+          flyTo={fly}
+          avoidPanel={false}
+          // Fit the chip's pins once the data arrives and whenever the chip changes.
+          fitKey={reports ? filter : null}
+        />
+      </div>
+    </div>
   );
 }
 

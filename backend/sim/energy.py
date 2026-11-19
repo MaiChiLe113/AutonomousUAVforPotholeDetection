@@ -102,7 +102,7 @@ def phase_speed_mps(phase: str, cfg: EnergyConfig = ENERGY) -> float:
 
 
 def phase_drain_pct_per_s(phase: str, cfg: EnergyConfig = ENERGY) -> float:
-    """Battery drain rate (% per simulated second) including `cfg.safety_factor`."""
+    """Battery drain rate (% per simulated second) including `cfg.safety_factor` and the wind factor."""
     if phase in _CRUISE_PHASES:
         endurance_min = cfg.cruise_endurance_min
     elif phase in _HOVER_PHASES:
@@ -111,7 +111,8 @@ def phase_drain_pct_per_s(phase: str, cfg: EnergyConfig = ENERGY) -> float:
         raise ValueError(f"unknown flight phase {phase!r}")
     if not math.isfinite(endurance_min) or endurance_min <= 0:
         raise ValueError(f"endurance_min for phase {phase!r} must be positive (got {endurance_min})")
-    return (100.0 / (endurance_min * 60.0)) * cfg.safety_factor
+    wind_factor = 1.0 + cfg.wind_drain_per_mps * max(0.0, cfg.wind_mps)  # wind costs battery, not time
+    return (100.0 / (endurance_min * 60.0)) * cfg.safety_factor * wind_factor
 
 
 # ---------------------------------------------------------------------------

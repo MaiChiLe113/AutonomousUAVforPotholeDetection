@@ -1,16 +1,16 @@
 import { cn } from "@/lib/cn";
 import { statusStyle, type StatusKind } from "@/lib/format";
-import type { CameraStatus, MissionState, PlanStatus, ReportStatus } from "@/lib/types";
+import type { CameraStatus, DecisionAction, DroneStatus, MissionState, PlanStatus, ReportStatus, TaskStatus } from "@/lib/types";
 
 export interface StatusBadgeProps {
-  status: ReportStatus | PlanStatus | MissionState | CameraStatus;
-  /** Which table to use; without it report, plan, mission, camera are tried in that order. */
+  status: ReportStatus | PlanStatus | MissionState | CameraStatus | DroneStatus | TaskStatus | DecisionAction;
+  /** Which table to use; without it the tables are tried in the order report, plan, mission, camera, drone, task, decision. */
   kind?: StatusKind;
   size?: "sm" | "md";
   className?: string;
 }
 
-/** Coloured pill for report / plan / mission / camera statuses (colours from lib/config). */
+/** Coloured pill for report / plan / mission / camera / drone / task / decision statuses (colours from lib/config). */
 export default function StatusBadge({ status, kind, size = "sm", className }: StatusBadgeProps) {
   const s = statusStyle(status, kind);
   return (

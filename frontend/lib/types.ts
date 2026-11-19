@@ -209,6 +209,99 @@ export interface ResetResult {
   reset_at: string;
 }
 
+// ---------------------------------------------------------------- fleet (GET /fleet)
+
+export type DroneStatus = "idle" | "flying" | "returning" | "swapping" | "offline";
+
+export type TaskStatus = "queued" | "held" | "dispatched" | "completed" | "cancelled" | "flagged";
+
+export type DecisionAction = "launch" | "hold" | "recall" | "abort";
+
+export interface GeoPoint {
+  lat: number;
+  lon: number;
+}
+
+export interface DronePosition extends GeoPoint {
+  alt_m: number;
+}
+
+/** One go / no-go decision of the dispatcher (the decision log; `code` is a short machine code). */
+export interface FlightDecision {
+  id: string;
+  at: string;
+  drone_id: string | null;
+  report_id: number | null;
+  action: DecisionAction;
+  code: string;
+  reason: string; // e.g. "wind 11 m/s > 8 m/s"
+}
+
+/** Simulated weather used by the go / no-go check. */
+export interface Weather {
+  wind_mps: number;
+  gust_mps: number;
+  rain: boolean;
+  flyable: boolean;
+  simulated: true;
+  updated_at: string;
+}
+
+export interface District {
+  name: string;
+  center: GeoPoint;
+  radius_m: number;
+}
+
+export interface Drone {
+  drone_id: string;
+  status: DroneStatus;
+  battery_pct: number;
+  position: DronePosition;
+  heading_deg: number;
+  mission_id: number | null;
+  report_id: number | null;
+  target: GeoPoint | null;
+  available_at: string | null; // when a swapping drone is ready again
+  last_decision: FlightDecision | null;
+}
+
+/** One inspection task waiting for (or past) dispatch. lat / lon is the pothole position. */
+export interface FleetTask {
+  task_id: number;
+  report_id: number;
+  status: TaskStatus;
+  priority: number; // higher flies first
+  created_at: string;
+  hold_reason: string | null;
+  lat: number;
+  lon: number;
+}
+
+export interface Fleet {
+  district: District;
+  base: GeoPoint;
+  weather: Weather;
+  drones: Drone[];
+  queue: FleetTask[];
+  decisions: FlightDecision[]; // newest first
+}
+
+/** POST /reports/{id}/enqueue. */
+export interface EnqueueResult {
+  task_id: number;
+  status: TaskStatus;
+  report_ids: number[];
+  drone_id: string | null;
+  flight_plan_id: number | null;
+  mission_id: number | null;
+}
+
+/** POST /dispatcher/tick. */
+export interface DispatchTickResult {
+  dispatched_mission_ids: number[];
+}
+
 // ---------------------------------------------------------------- frontend-only (not in schemas.py)
 
 export type Role = "resident" | "monitor";

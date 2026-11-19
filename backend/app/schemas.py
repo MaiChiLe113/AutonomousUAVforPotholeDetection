@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -192,3 +192,94 @@ class ResetOut(BaseModel):
     flight_plans: int
     missions: int
     reset_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# GET /fleet (district, drones, queue, weather, decision log). Mirror in frontend/lib/types.ts.
+# ---------------------------------------------------------------------------
+class LatLon(BaseModel):
+    lat: float
+    lon: float
+
+
+class LatLonAlt(LatLon):
+    alt_m: float
+
+
+class DistrictOut(BaseModel):
+    name: str
+    center: LatLon
+    radius_m: float
+
+
+class WeatherOut(BaseModel):
+    """Simulated weather (seeded timeline); `simulated` is always true until a real feed exists."""
+
+    wind_mps: float
+    gust_mps: float
+    rain: bool
+    flyable: bool
+    simulated: Literal[True] = True
+    updated_at: datetime
+
+
+class DecisionOut(BaseModel):
+    """One go / no-go decision of the fleet (launch, hold, recall, abort) with a human readable reason."""
+
+    id: str
+    at: datetime
+    drone_id: str | None = None
+    report_id: int | None = None
+    action: Literal["launch", "hold", "recall", "abort"]
+    code: str
+    reason: str
+
+
+class FleetDroneOut(BaseModel):
+    drone_id: str
+    status: Literal["idle", "flying", "returning", "swapping", "offline"]
+    battery_pct: float
+    position: LatLonAlt
+    heading_deg: float
+    mission_id: int | None = None
+    report_id: int | None = None
+    target: LatLon | None = None
+    available_at: datetime | None = None  # when a returning / swapping / flying drone can take a new task
+    last_decision: DecisionOut | None = None
+
+
+class QueueItemOut(BaseModel):
+    task_id: int  # same id as EnqueueOut.task_id (the first report's id)
+    report_id: int  # first report of the task (merged reports share one task)
+    status: Literal["queued", "held", "dispatched", "completed", "cancelled", "flagged"]
+    priority: int
+    created_at: datetime
+    hold_reason: str | None = None
+    lat: float
+    lon: float
+
+
+class EnqueueOut(BaseModel):
+    """POST /reports/{id}/enqueue: the inspection task of the report."""
+
+    task_id: int
+    status: Literal["queued", "held", "dispatched", "completed", "cancelled", "flagged"]
+    report_ids: list[int]
+    drone_id: str | None = None
+    flight_plan_id: int | None = None
+    mission_id: int | None = None
+
+
+class TickOut(BaseModel):
+    """POST /dispatcher/tick."""
+
+    dispatched_mission_ids: list[int]
+
+
+class FleetOut(BaseModel):
+    district: DistrictOut
+    base: LatLon
+    weather: WeatherOut
+    drones: list[FleetDroneOut]
+    queue: list[QueueItemOut]
+    decisions: list[DecisionOut]  # newest first, capped by SafetyConfig.decision_log_max

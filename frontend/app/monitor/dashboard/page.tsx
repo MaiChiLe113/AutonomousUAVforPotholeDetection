@@ -1,30 +1,29 @@
 "use client";
 
-// SCRUM-39 live UAV dashboard. /monitor/dashboard?mission=ID follows one mission (UC-M4, UC-M5);
-// without ?mission it lists the active missions. useSearchParams needs the <Suspense> boundary for `next build`.
+// /monitor/dashboard is the Fleet tab (3 UAV cards + inspection queue).
+// /monitor/dashboard?mission=ID is the live view of one mission (SCRUM-39, UC-M4, UC-M5); the layout then
+// keeps its full-bleed map inside the content pane next to the monitor sidebar.
+// useSearchParams needs the <Suspense> boundary for `next build`.
 
 import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 
-import ActiveMissions from "@/components/monitor/ActiveMissions";
+import FleetView from "@/components/monitor/fleet/FleetView";
 import MissionDashboard from "@/components/monitor/MissionDashboard";
-import RoleGate from "@/components/RoleGate";
 import { ButtonLink, EmptyState, FloatingPanel, LoadingState } from "@/components/ui";
 import { MONITOR_ROUTES } from "@/lib/config";
 
 export default function DashboardPage() {
   return (
-    <RoleGate role="monitor">
-      <Suspense fallback={<LoadingState className="absolute inset-0" />}>
-        <Dashboard />
-      </Suspense>
-    </RoleGate>
+    <Suspense fallback={<LoadingState className="absolute inset-0" />}>
+      <Dashboard />
+    </Suspense>
   );
 }
 
 function Dashboard() {
   const raw = useSearchParams().get("mission");
-  if (raw === null || raw === "") return <ActiveMissions />;
+  if (raw === null || raw === "") return <FleetView />;
 
   const id = Number(raw);
   if (!Number.isInteger(id) || id <= 0) {
@@ -35,7 +34,7 @@ function Dashboard() {
           description={`"${raw}" is not a mission id.`}
           action={
             <ButtonLink href={MONITOR_ROUTES.dashboard()} variant="secondary">
-              Show active missions
+              Show the fleet
             </ButtonLink>
           }
         />

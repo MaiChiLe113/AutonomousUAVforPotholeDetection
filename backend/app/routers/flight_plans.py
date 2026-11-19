@@ -8,15 +8,23 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import FlightPlan, Mission, MissionState, PlanStatus, Report, ReportStatus
+from app.routers.auth import require_monitor
 from app.routers.common import conflict, get_or_404, now_utc
-from app.schemas import FlightPlanOut, PlanDecision, ReportOut
-from app.services.dispatcher import cancel_task, dispatch_tick, enqueue_report
+from app.schemas import EnqueueOut, FlightPlanOut, PlanDecision, ReportOut, TickOut
+from app.services.dispatcher import (
+    TaskStatus,
+    cancel_task,
+    dispatch_tick,
+    enqueue_report,
+    get_task_for_report,
+)
 from app.services.fleet import DroneStatus, get_drone_state, select_drone_for_target
 from app.services.flight_planner import FlightPlanner, OutOfServiceAreaError
 
 router = APIRouter(tags=["flight-plans"])
 
 _ACTIVE_PLAN = (PlanStatus.proposed, PlanStatus.approved)
+MONITOR = Depends(require_monitor)  # control endpoints: X-Role must be the monitor role
 
 
 def _new_plan(
@@ -58,13 +66,17 @@ def _proposed_plan(db: Session, plan_id: int) -> FlightPlan:
     return plan
 
 
-@router.post("/reports/{report_id}/flight-plan", response_model=FlightPlanOut, status_code=201)
+@router.post("/reports/{report_id}/flight-plan", response_model=FlightPlanOut, status_code=201, dependencies=[MONITOR])
 def propose_flight_plan(report_id: int, db: Session = Depends(get_db)) -> FlightPlan:
     """Generate a plan with services.flight_planner for a confirmed report. SCRUM-27.
-    409 when the report is not under_review or already has a proposed / approved plan."""
+    409 when the report is not under_review, already has a proposed / approved plan, or already has an
+    open inspection task (the fleet plans it itself; this manual plan is only an override when no task exists)."""
     report = get_or_404(db, Report, report_id, "Report")
     if report.status != ReportStatus.under_review:
         raise conflict(f"Report {report_id} is {report.status.value}; a flight plan needs an under_review report")
+    task = get_task_for_report(db, report_id)
+    if task is not None and task.status in (TaskStatus.queued, TaskStatus.held, TaskStatus.dispatched):
+        raise conflict(f"Report {report_id} is already in the inspection queue ({task.status.value})")
     active = next((p for p in reversed(report.flight_plans) if p.status in _ACTIVE_PLAN), None)
     if active is not None:
         raise conflict(f"Report {report_id} already has flight plan {active.id} ({active.status.value})")
@@ -93,7 +105,7 @@ def get_flight_plan(plan_id: int, db: Session = Depends(get_db)) -> FlightPlan:
     return get_or_404(db, FlightPlan, plan_id, "Flight plan")
 
 
-@router.post("/flight-plans/{plan_id}/approve", response_model=FlightPlanOut)
+@router.post("/flight-plans/{plan_id}/approve", response_model=FlightPlanOut, dependencies=[MONITOR])
 def approve_flight_plan(plan_id: int, db: Session = Depends(get_db)) -> FlightPlan:
     """Approve and create a pending Mission. Log the decision. SCRUM-31.
     The response carries mission_id for "Launch UAV" (POST /missions/{id}/dispatch)."""
@@ -106,7 +118,7 @@ def approve_flight_plan(plan_id: int, db: Session = Depends(get_db)) -> FlightPl
     return plan
 
 
-@router.post("/flight-plans/{plan_id}/reject", response_model=FlightPlanOut)
+@router.post("/flight-plans/{plan_id}/reject", response_model=FlightPlanOut, dependencies=[MONITOR])
 def reject_flight_plan(plan_id: int, body: PlanDecision, db: Session = Depends(get_db)) -> FlightPlan:
     """Reject with a required reason (422 without one or with a blank one). Log the decision. SCRUM-31.
     No flight happens, so the report is closed as rejected with the plan reason as its review_note."""
@@ -121,7 +133,7 @@ def reject_flight_plan(plan_id: int, body: PlanDecision, db: Session = Depends(g
     return plan
 
 
-@router.post("/flight-plans/{plan_id}/request-changes", response_model=FlightPlanOut)
+@router.post("/flight-plans/{plan_id}/request-changes", response_model=FlightPlanOut, dependencies=[MONITOR])
 def request_changes(plan_id: int, body: PlanDecision, db: Session = Depends(get_db)) -> FlightPlan:
     """Send back for changes; the planner proposes a new version. SCRUM-31.
     The old plan becomes changes_needed (with the reason); returns the NEW proposed plan."""
@@ -136,24 +148,24 @@ def request_changes(plan_id: int, body: PlanDecision, db: Session = Depends(get_
     return new_plan
 
 
-@router.post("/reports/{report_id}/enqueue")
-def enqueue_report_endpoint(report_id: int, db: Session = Depends(get_db)) -> dict:
+@router.post("/reports/{report_id}/enqueue", response_model=EnqueueOut, dependencies=[MONITOR])
+def enqueue_report_endpoint(report_id: int, db: Session = Depends(get_db)) -> EnqueueOut:
     """Queue a confirmed report for automatic dispatch (merges within report_merge_radius_m)."""
     try:
         task = enqueue_report(db, report_id)
     except OutOfServiceAreaError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {
-        "task_id": task.task_id,
-        "status": task.status.value,
-        "report_ids": task.report_ids,
-        "drone_id": task.drone_id,
-        "flight_plan_id": task.plan_id,
-        "mission_id": task.mission_id,
-    }
+    return EnqueueOut(
+        task_id=task.task_id,
+        status=task.status.value,  # type: ignore[arg-type]
+        report_ids=task.report_ids,
+        drone_id=task.drone_id,
+        flight_plan_id=task.plan_id,
+        mission_id=task.mission_id,
+    )
 
 
-@router.post("/reports/{report_id}/cancel", response_model=ReportOut)
+@router.post("/reports/{report_id}/cancel", response_model=ReportOut, dependencies=[MONITOR])
 def cancel_queued_report(
     report_id: int,
     body: PlanDecision | None = None,
@@ -165,8 +177,8 @@ def cancel_queued_report(
     return get_or_404(db, Report, report_id, "Report")
 
 
-@router.post("/dispatcher/tick")
-def trigger_dispatch_tick(db: Session = Depends(get_db)) -> dict:
+@router.post("/dispatcher/tick", response_model=TickOut, dependencies=[MONITOR])
+def trigger_dispatch_tick(db: Session = Depends(get_db)) -> TickOut:
     """Advance active missions and dispatch any queued tasks."""
     missions = dispatch_tick(db)
-    return {"dispatched_mission_ids": [m.id for m in missions]}
+    return TickOut(dispatched_mission_ids=[m.id for m in missions])

@@ -1,18 +1,23 @@
 // One typed wrapper per backend endpoint. Errors are thrown as ApiError with the
 // FastAPI `detail` text as the message (422 validation lists are joined).
 
-import { API_URL } from "./config";
+import { API, API_URL } from "./config";
+import { getSession } from "./session";
 import type {
   CameraSession,
   Detection,
+  DispatchTickResult,
   DroneTelemetryIn,
+  EnqueueResult,
   FlightPlan,
+  Fleet,
   Metrics,
   Mission,
   MissionResultsIn,
   Report,
   ReportStatus,
   ResetResult,
+  Role,
   Telemetry,
   TelemetryIn,
 } from "./types";
@@ -36,10 +41,17 @@ function detailText(detail: unknown): string | null {
   return null;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** Role of the signed-in user for the X-Role header (demo auth: the backend trusts it). */
+function currentRole(): Role {
+  return getSession()?.role ?? API.anonymousRole;
+}
+
+async function request<T>(path: string, init?: RequestInit, role?: Role): Promise<T> {
   let res: Response;
+  const headers = new Headers(init?.headers);
+  headers.set(API.roleHeader, role ?? currentRole());
   try {
-    res = await fetch(`${API_URL}${path}`, { cache: "no-store", ...init });
+    res = await fetch(`${API_URL}${path}`, { cache: "no-store", ...init, headers });
   } catch {
     throw new ApiError(`Cannot reach the server at ${API_URL}.`, 0);
   }
@@ -119,6 +131,21 @@ export const getCamera = (missionId: number) => request<CameraSession>(`/mission
 export const stopCamera = (missionId: number) =>
   request<CameraSession>(`/missions/${missionId}/camera/stop`, json("POST"));
 
+// Fleet (GET /fleet) and monitor overrides
+/** District, base, weather, 3 UAVs, the inspection queue and the go / no-go decision log. */
+export const getFleet = () => request<Fleet>(`/fleet`);
+/** Monitor override: bring a flying UAV home and requeue its task. `reason` is optional on the server. */
+export const recallMission = (missionId: number, reason?: string) =>
+  request<Mission>(`/missions/${missionId}/recall`, json("POST", reason ? { reason } : undefined));
+/** Monitor override: cancel a queued inspection task; its reports are closed as rejected. */
+export const cancelReport = (reportId: number, reason?: string) =>
+  request<Report>(`/reports/${reportId}/cancel`, json("POST", reason ? { reason } : undefined));
+/** Queue a confirmed report for automatic dispatch (422 when it is outside the service area). */
+export const enqueueReport = (reportId: number) =>
+  request<EnqueueResult>(`/reports/${reportId}/enqueue`, json("POST"));
+/** Run the dispatcher now (it also runs on its own every few seconds). */
+export const tickDispatcher = () => request<DispatchTickResult>(`/dispatcher/tick`, json("POST"));
+
 // Telemetry ingest (raw drone app JSON)
 export const ingestTelemetry = (raw: DroneTelemetryIn) =>
   request<Telemetry>(`/telemetry/ingest`, json("POST", raw));
@@ -130,4 +157,4 @@ export const driftReportUrl = () => `${API_URL}/monitoring/drift-report`;
 
 // Demo
 /** Reseed the demo data (login screen "Reset demo"). */
-export const resetDemo = () => request<ResetResult>(`/dev/reset`, json("POST"));
+export const resetDemo = () => request<ResetResult>(`/dev/reset`, json("POST"), API.anonymousRole);

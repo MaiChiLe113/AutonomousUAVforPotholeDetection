@@ -5,13 +5,14 @@ from __future__ import annotations
 import enum
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import AppMeta, FlightPlan, Mission, MissionState
 from app.services.flight_planner import FlightPlanner, OutOfServiceAreaError
+from app.services.simclock import sim_delta, sim_elapsed_s
 from config import ENERGY, FLEET, UAV, EnergyConfig, FleetConfig
 from sim.energy import estimate, haversine_m
 from sim.mock_flight import telemetry_at
@@ -241,12 +242,12 @@ def _landed_from_mission_end(
     if _at_base_ground(end_pt, base):
         return m_end_time, end_bat
     ret_est = estimate(_return_route(end_pt, base), start_battery_pct=end_bat, start_pos=end_pt, cfg=energy_cfg)
-    return m_end_time + timedelta(seconds=ret_est.duration_s), ret_est.end_battery_pct
+    return m_end_time + sim_delta(ret_est.duration_s, energy_cfg), ret_est.end_battery_pct
 
 
 def _available_after_landing(landed_at: datetime, landed_bat: float, energy_cfg: EnergyConfig) -> datetime:
     if landed_bat < energy_cfg.swap_below_pct:
-        return landed_at + timedelta(seconds=energy_cfg.swap_duration_s)
+        return landed_at + sim_delta(energy_cfg.swap_duration_s, energy_cfg)
     return landed_at
 
 
@@ -289,9 +290,10 @@ def get_drone_state(
         m_start = stored if stored is not None else MissionStart(pos[0], pos[1], pos[2], battery)
         route = m.flight_plan.route
         est = estimate(route, start_battery_pct=m_start.battery_pct, start_pos=m_start.pos, cfg=energy_cfg)
-        elapsed_s = max(0.0, (now - started_at).total_seconds())
+        elapsed_s = max(0.0, sim_elapsed_s(started_at, now, energy_cfg))
 
-        if m.state not in (MissionState.done, MissionState.failed) and elapsed_s < est.duration_s:
+        still_flying = elapsed_s < est.duration_s - energy_cfg.time_epsilon_s
+        if m.state not in (MissionState.done, MissionState.failed) and still_flying:
             sample = telemetry_at(
                 route,
                 elapsed_s,
@@ -301,7 +303,7 @@ def get_drone_state(
                 start_pos=m_start.pos,
                 energy_cfg=energy_cfg,
             )
-            m_end_time = started_at + timedelta(seconds=est.duration_s)
+            m_end_time = started_at + sim_delta(est.duration_s, energy_cfg)
             landed_at, landed_bat = _landed_from_mission_end(
                 est.legs[-1].end, est.end_battery_pct, m_end_time, base, energy_cfg
             )
@@ -317,7 +319,7 @@ def get_drone_state(
                 base_lon=base[1],
                 base_alt_m=base[2],
                 available_at=avail_at,
-                available_sim_s=max(0.0, (avail_at - now).total_seconds()),
+                available_sim_s=max(0.0, sim_elapsed_s(now, avail_at, energy_cfg)),
                 active_mission_id=m.id,
                 last_mission_id=m.id,
             )
@@ -327,14 +329,14 @@ def get_drone_state(
             m_end_time = (
                 _utc(m.finished_at)
                 if m.finished_at is not None
-                else started_at + timedelta(seconds=est.duration_s)
+                else started_at + sim_delta(est.duration_s, energy_cfg)
             )
             end_pt = stored_end.pos
             end_bat = stored_end.battery_pct
             must_return = stored_end.recalled
         elif m.state == MissionState.failed:
             m_end_time = _utc(m.finished_at) if m.finished_at is not None else started_at
-            fail_elapsed = max(0.0, (m_end_time - started_at).total_seconds())
+            fail_elapsed = max(0.0, sim_elapsed_s(started_at, m_end_time, energy_cfg))
             sample = telemetry_at(
                 route,
                 fail_elapsed,
@@ -348,7 +350,7 @@ def get_drone_state(
             end_bat = sample["battery_pct"]
             must_return = False
         else:
-            m_end_time = started_at + timedelta(seconds=est.duration_s)
+            m_end_time = started_at + sim_delta(est.duration_s, energy_cfg)
             end_pt = est.legs[-1].end
             end_bat = est.end_battery_pct
             must_return = False
@@ -360,10 +362,10 @@ def get_drone_state(
         else:
             ret_route = _return_route(end_pt, base)
             ret_est = estimate(ret_route, start_battery_pct=end_bat, start_pos=end_pt, cfg=energy_cfg)
-            ret_done_at = m_end_time + timedelta(seconds=ret_est.duration_s)
+            ret_done_at = m_end_time + sim_delta(ret_est.duration_s, energy_cfg)
 
             if next_start is not None and next_start < ret_done_at:
-                after_s = max(0.0, (next_start - m_end_time).total_seconds())
+                after_s = max(0.0, sim_elapsed_s(m_end_time, next_start, energy_cfg))
                 if after_s <= 1e-6:
                     pos, battery = end_pt, end_bat
                 else:
@@ -387,7 +389,7 @@ def get_drone_state(
                 continue
 
             if now < ret_done_at:
-                after_s = max(0.0, (now - m_end_time).total_seconds())
+                after_s = max(0.0, sim_elapsed_s(m_end_time, now, energy_cfg))
                 sample = telemetry_at(
                     ret_route,
                     after_s,
@@ -409,14 +411,14 @@ def get_drone_state(
                     base_lon=base[1],
                     base_alt_m=base[2],
                     available_at=avail_at,
-                    available_sim_s=max(0.0, (avail_at - now).total_seconds()),
+                    available_sim_s=max(0.0, sim_elapsed_s(now, avail_at, energy_cfg)),
                     active_mission_id=None,
                     last_mission_id=m.id,
                 )
             landed_at, landed_bat = ret_done_at, ret_est.end_battery_pct
 
         if landed_bat < energy_cfg.swap_below_pct:
-            swap_end = landed_at + timedelta(seconds=energy_cfg.swap_duration_s)
+            swap_end = landed_at + sim_delta(energy_cfg.swap_duration_s, energy_cfg)
             if now < swap_end and (next_start is None or now < next_start):
                 return DroneState(
                     drone_id=drone_id,
@@ -429,7 +431,7 @@ def get_drone_state(
                     base_lon=base[1],
                     base_alt_m=base[2],
                     available_at=swap_end,
-                    available_sim_s=max(0.0, (swap_end - now).total_seconds()),
+                    available_sim_s=max(0.0, sim_elapsed_s(now, swap_end, energy_cfg)),
                     active_mission_id=None,
                     last_mission_id=m.id,
                 )

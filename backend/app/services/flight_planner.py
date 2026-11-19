@@ -105,7 +105,7 @@ class FlightPlanner:
         )
         for target_lat, target_lon in targets:
             dist_from_base_m = haversine_m(home, (target_lat, target_lon))
-            if dist_from_base_m > self.fleet.service_radius_m + 1e-3:
+            if dist_from_base_m > self.fleet.service_radius_m + self.fleet.area_epsilon_m:
                 raise OutOfServiceAreaError(
                     f"Target ({target_lat:.5f}, {target_lon:.5f}) is {dist_from_base_m:.0f} m from base, "
                     f"outside the {self.fleet.service_radius_m:.0f} m service area"

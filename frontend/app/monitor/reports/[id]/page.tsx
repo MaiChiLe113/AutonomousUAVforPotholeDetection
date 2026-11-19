@@ -1,7 +1,8 @@
 "use client";
 
 // UC-M2 review a report (SCRUM-29, SCRUM-37, SCRUM-27): photo with the AI boxes, "Wrong detection" per row,
-// "Confirm & propose flight plan" (review, then propose, then open the plan) or Reject with a reason.
+// "Confirm & queue for UAV" (the backend queues and dispatches on its own; then open the live view or the Fleet
+// tab) or Reject with a reason.
 
 import { useParams, useRouter } from "next/navigation";
 import { useMemo, useState, type ReactNode } from "react";
@@ -12,8 +13,8 @@ import DetectionRows from "@/components/monitor/DetectionRows";
 import RoleGate from "@/components/RoleGate";
 import StatusBadge from "@/components/StatusBadge";
 import { Banner, Button, ButtonLink, EmptyState, FloatingPanel, LoadingState, PanelSection, ReasonDialog } from "@/components/ui";
-import { ApiError, flagDetection, getReport, proposeFlightPlan, reviewReport } from "@/lib/api";
-import { MAP, MONITOR_ROUTES, REPORT_STATUS } from "@/lib/config";
+import { ApiError, flagDetection, getFleet, getReport, reviewReport } from "@/lib/api";
+import { MAP, MONITOR, MONITOR_ROUTES, REPORT_STATUS } from "@/lib/config";
 import { formatDateTime } from "@/lib/format";
 import { usePoll } from "@/lib/hooks";
 import type { Detection, Report } from "@/lib/types";
@@ -67,18 +68,9 @@ function ReviewReport() {
     setBusy(true);
     setError(null);
     try {
-      await reviewReport(rid, true);
-      let planId: number;
-      try {
-        planId = (await proposeFlightPlan(rid)).id;
-      } catch (e) {
-        // 409: a proposed / approved plan already exists -> open it.
-        if (!(e instanceof ApiError && e.status === 409)) throw e;
-        const fresh = await getReport(rid);
-        if (fresh.latest_plan_id == null) throw e;
-        planId = fresh.latest_plan_id;
-      }
-      router.push(MONITOR_ROUTES.plan(planId));
+      // The backend queues the report and dispatches it when the go / no-go check allows.
+      const updated = await reviewReport(rid, true);
+      router.push(MONITOR_ROUTES.dashboard(updated.mission_id));
     } catch (e) {
       setError((e as Error).message || "Could not confirm the report.");
       setBusy(false);
@@ -95,7 +87,10 @@ function ReviewReport() {
     report?.status === "under_review" && report.latest_plan_id != null && (report.latest_plan_status === "proposed" || report.latest_plan_status === "approved")
       ? { id: report.latest_plan_id, status: report.latest_plan_status }
       : null;
-  const canDecide = report?.status === "under_review" && !activePlan;
+  // Confirmed reports wait in the dispatcher queue until a UAV may fly; the Fleet answer says why they are held.
+  const fleet = usePoll(getFleet, MONITOR.fleetPollMs, { enabled: validId && report?.status === "under_review" });
+  const queued = fleet.data?.queue.find((t) => t.report_id === rid && MONITOR.waitingTaskStatuses.includes(t.status)) ?? null;
+  const canDecide = report?.status === "under_review" && !activePlan && !queued;
 
   let footer: ReactNode = null;
   if (report && report.status === "under_review") {
@@ -105,11 +100,20 @@ function ReviewReport() {
         {canDecide ? (
           <div className="flex flex-col gap-2">
             <Button size="lg" fullWidth loading={busy} onClick={onConfirm}>
-              Confirm &amp; propose flight plan
+              Confirm &amp; queue for UAV
             </Button>
             <Button size="lg" variant="danger" fullWidth disabled={busy} onClick={() => setRejectOpen(true)}>
               Reject
             </Button>
+          </div>
+        ) : queued ? (
+          <div className="flex flex-col gap-2">
+            <Banner tone={queued.status === "held" ? "warning" : "info"} title={queued.status === "held" ? "Held on the ground" : "Queued for a UAV"}>
+              {queued.hold_reason ?? "A UAV takes this report as soon as one is cleared to fly."}
+            </Banner>
+            <ButtonLink size="lg" fullWidth variant="secondary" href={MONITOR_ROUTES.dashboard()}>
+              Open the fleet
+            </ButtonLink>
           </div>
         ) : activePlan ? (
           <div className="flex flex-col gap-2">

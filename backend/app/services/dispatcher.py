@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import enum
+import functools
 import json
+import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -34,6 +36,8 @@ from app.services.fleet import (
     record_mission_start,
 )
 from app.services.flight_planner import FlightPlanner, OutOfServiceAreaError
+from app.services.safety import SafetyGate, log_decision, mid_flight_check, report_priority
+from app.services.simclock import sim_delta, sim_elapsed_s
 from config import ENERGY, FLEET, EnergyConfig, FleetConfig
 from sim.energy import estimate, haversine_m
 from sim.mock_flight import telemetry_at
@@ -43,9 +47,24 @@ _EDGE_FAIL_PREFIX = "dispatcher:edge_fail:"
 _PLAN_REPORTS_PREFIX = "dispatcher:plan_reports:"
 _SPLICE_BAT_PREFIX = "dispatcher:splice_bat:"
 
+# One tick at a time: the background loop and API requests must not allocate the same task twice.
+_TICK_LOCK = threading.RLock()  # re-entrant: recall_mission() ticks again from inside a tick
+
+
+def _locked(fn):
+    """Run `fn` holding the tick lock, so state-changing overrides never interleave with a tick."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _TICK_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
+
 
 class TaskStatus(enum.StrEnum):
     queued = "queued"
+    held = "held"  # waiting on the ground: the safety gate said no (weather, battery); retried every tick
     dispatched = "dispatched"
     completed = "completed"
     cancelled = "cancelled"
@@ -67,10 +86,21 @@ class InspectionTask:
     retries: int = 0
     decided_by: str = "system"
     failure_reason: str | None = None
+    priority: int = 0
+    hold_reason: str | None = None
+    hold_code: str | None = None
+
+
+_PENDING = (TaskStatus.queued, TaskStatus.held)
 
 
 def _utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _clear_hold(task: InspectionTask) -> None:
+    task.hold_reason = None
+    task.hold_code = None
 
 
 def _task_key(task_id: int) -> str:
@@ -105,6 +135,9 @@ def _serialize_task(task: InspectionTask) -> str:
             "retries": int(task.retries),
             "decided_by": task.decided_by,
             "failure_reason": task.failure_reason,
+            "priority": int(task.priority),
+            "hold_reason": task.hold_reason,
+            "hold_code": task.hold_code,
         }
     )
 
@@ -127,6 +160,9 @@ def _deserialize_task(raw: str) -> InspectionTask:
         retries=int(data.get("retries", 0)),
         decided_by=str(data.get("decided_by", "system")),
         failure_reason=data.get("failure_reason"),
+        priority=int(data.get("priority", 0)),
+        hold_reason=data.get("hold_reason"),
+        hold_code=data.get("hold_code"),
     )
 
 
@@ -151,6 +187,11 @@ def list_tasks(db: Session, status: TaskStatus | None = None) -> list[Inspection
         tasks = [t for t in tasks if t.status == status]
     tasks.sort(key=lambda t: (t.created_at, t.task_id))
     return tasks
+
+
+def list_pending_tasks(db: Session) -> list[InspectionTask]:
+    """Tasks waiting for a drone: queued, or held on the ground by the safety gate."""
+    return [t for t in list_tasks(db) if t.status in _PENDING]
 
 
 def get_task_for_report(db: Session, report_id: int) -> InspectionTask | None:
@@ -256,7 +297,7 @@ def _fail_mission_edge(
         cfg=energy_cfg,
     )
     elapsed_s = (
-        max(0.0, (t_event - _utc(mission.started_at)).total_seconds())
+        max(0.0, sim_elapsed_s(_utc(mission.started_at), t_event, energy_cfg))
         if mission.started_at is not None
         else est.duration_s
     )
@@ -277,6 +318,15 @@ def _fail_mission_edge(
     )
     mission.state = MissionState.failed
     mission.finished_at = t_event
+    log_decision(
+        db,
+        "abort",
+        "edge_failure",
+        f"{mission.flight_plan.drone_id} aborted: {reason}",
+        at=t_event,
+        drone_id=mission.flight_plan.drone_id,
+        report_id=mission.report_id,
+    )
 
     for task in get_tasks_for_mission(db, mission.id):
         if task.retries < fleet_cfg.max_task_retries:
@@ -287,6 +337,7 @@ def _fail_mission_edge(
             task.plan_id = None
             task.mission_id = None
             task.failure_reason = reason
+            _clear_hold(task)
             _sync_task_report_statuses(db, task, ReportStatus.under_review)
         else:
             task.status = TaskStatus.flagged
@@ -298,6 +349,7 @@ def _fail_mission_edge(
     db.flush()
 
 
+@_locked
 def fail_mission_edge(
     db: Session,
     mission_id: int,
@@ -344,6 +396,7 @@ def _requeue_mission_task(
                     created_at=_utc(report.created_at),
                     queued_at=t_event,
                     report_ids=[report.id],
+                    priority=report_priority(report),
                 )
             ]
     for task in tasks:
@@ -354,6 +407,7 @@ def _requeue_mission_task(
         task.mission_id = None
         task.decided_by = decided_by
         task.failure_reason = reason
+        _clear_hold(task)
         save_task(db, task)
         _sync_task_report_statuses(db, task, ReportStatus.under_review)
     return tasks
@@ -378,7 +432,7 @@ def _handle_offline_flying_missions(
         if not is_drone_offline(db, drone_id):
             continue
         m_start = get_mission_start(db, m, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
-        elapsed_s = max(0.0, (now - _utc(m.started_at)).total_seconds()) if m.started_at else 0.0
+        elapsed_s = max(0.0, sim_elapsed_s(_utc(m.started_at), now, energy_cfg)) if m.started_at else 0.0
         sample = telemetry_at(
             m.flight_plan.route,
             elapsed_s,
@@ -395,6 +449,15 @@ def _handle_offline_flying_missions(
         )
         m.state = MissionState.failed
         m.finished_at = now
+        log_decision(
+            db,
+            "abort",
+            "offline",
+            f"{drone_id} went offline mid-flight",
+            at=now,
+            drone_id=drone_id,
+            report_id=m.report_id,
+        )
         _requeue_mission_task(db, m, now, decided_by="system", reason=f"Drone {drone_id} went offline")
         db.flush()
 
@@ -413,8 +476,67 @@ def _mark_tasks_dispatched(
         t.plan_id = plan_id
         t.mission_id = mission_id
         t.decided_by = "system"
+        _clear_hold(t)
         save_task(db, t)
         _sync_task_report_statuses(db, t, ReportStatus.uav_dispatched)
+
+
+def _log_launch(
+    db: Session,
+    at: datetime,
+    drone_id: str,
+    tasks: list[InspectionTask],
+    battery_pct: float,
+    gate: SafetyGate,
+    *,
+    inserted: bool = False,
+) -> None:
+    report_ids = [rid for t in tasks for rid in t.report_ids]
+    wx = gate.weather
+    verb = "Added report" if inserted else "Launched for report"
+    log_decision(
+        db,
+        "launch",
+        "go",
+        f"{drone_id} {verb} {', '.join(str(r) for r in report_ids)}: battery {battery_pct:.0f}%, "
+        f"wind {wx.wind_mps:.1f} m/s, {'rain' if wx.rain else 'no rain'}",
+        at=at,
+        drone_id=drone_id,
+        report_id=report_ids[0] if report_ids else None,
+    )
+
+
+def _update_holds(
+    db: Session,
+    eligible: list[InspectionTask],
+    launched_task_ids: set[int],
+    gate: SafetyGate,
+    at: datetime,
+) -> None:
+    """Hold the tasks the gate blocked; release held tasks the gate cleared but that no drone took yet."""
+    for task in eligible:
+        if task.task_id in launched_task_ids:
+            continue
+        blocked = gate.blocked(task.task_id)
+        if blocked is not None:
+            first_time = task.status != TaskStatus.held or task.hold_code != blocked.code
+            task.status = TaskStatus.held
+            task.hold_reason = blocked.reason
+            task.hold_code = blocked.code
+            save_task(db, task)
+            if first_time:
+                log_decision(
+                    db,
+                    "hold",
+                    blocked.code,
+                    blocked.reason,
+                    at=at,
+                    report_id=task.report_ids[0] if task.report_ids else None,
+                )
+        elif task.status == TaskStatus.held:  # the gate no longer blocks it: it only waits for a drone now
+            task.status = TaskStatus.queued
+            _clear_hold(task)
+            save_task(db, task)
 
 
 def _allocate_at(
@@ -425,20 +547,23 @@ def _allocate_at(
     *,
     allocator: str | None = None,
 ) -> list[Mission]:
-    """Assign eligible queued tasks using the configured allocator (`baseline` or `auction`)."""
-    eligible = [t for t in list_tasks(db, TaskStatus.queued) if _utc(t.queued_at) <= t_event]
+    """Assign eligible queued or held tasks using the configured allocator, behind the safety gate.
+
+    A task the gate blocks (weather, battery) becomes `held` with a reason; it is retried on every tick and
+    launches by itself once the gate says go. Every launch and every new hold goes to the decision log."""
+    eligible = [t for t in list_pending_tasks(db) if _utc(t.queued_at) <= t_event]
     if not eligible:
         return []
 
     alloc = get_allocator(allocator or fleet_cfg.allocator)
     fleet = get_fleet_state(db, t_event, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
-    winning_bids = alloc.allocate(db, eligible, fleet, t_event, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
-    if not winning_bids:
-        return []
+    gate = SafetyGate(db, t_event, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
+    winning_bids = alloc.allocate(db, eligible, fleet, t_event, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg, gate=gate)
 
     planner = FlightPlanner(energy=energy_cfg, fleet=fleet_cfg)
     by_id = {t.task_id: t for t in eligible}
     dispatched: list[Mission] = []
+    launched_task_ids: set[int] = set()
 
     for bid in winning_bids:
         if bid.free_in_s > 0.0:
@@ -480,6 +605,8 @@ def _allocate_at(
                 plan_id=mission.flight_plan_id,
                 mission_id=mission.id,
             )
+            _log_launch(db, t_event, bid.drone_id, tasks_for_bid, bid.start_battery_pct, gate, inserted=True)
+            launched_task_ids.update(t.task_id for t in tasks_for_bid)
             db.flush()
             if mission not in dispatched:
                 dispatched.append(mission)
@@ -527,9 +654,12 @@ def _allocate_at(
             plan_id=plan.id,
             mission_id=mission.id,
         )
+        _log_launch(db, t_event, bid.drone_id, tasks_for_bid, bid.start_battery_pct, gate)
+        launched_task_ids.update(t.task_id for t in tasks_for_bid)
         db.flush()
         dispatched.append(mission)
 
+    _update_holds(db, eligible, launched_task_ids, gate, t_event)
     return dispatched
 
 
@@ -540,12 +670,33 @@ def dispatch_tick(
     allocator: str | None = None,
     fleet_cfg: FleetConfig = FLEET,
     energy_cfg: EnergyConfig = ENERGY,
+    weather_check: bool = True,
 ) -> list[Mission]:
-    """Advance active missions, handle offline/edge failures, chain returning drones, and dispatch queued tasks."""
+    """Advance active missions, handle offline/edge failures, recall in bad weather, chain returning drones,
+    and dispatch queued or held tasks (behind the safety gate).
+
+    `weather_check=False` skips the mid-flight recall check (used by the tick nested inside a recall)."""
+    with _TICK_LOCK:
+        return _dispatch_tick(
+            db, now, allocator=allocator, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg, weather_check=weather_check
+        )
+
+
+def _dispatch_tick(
+    db: Session,
+    now: datetime | None,
+    *,
+    allocator: str | None,
+    fleet_cfg: FleetConfig,
+    energy_cfg: EnergyConfig,
+    weather_check: bool,
+) -> list[Mission]:
     t_now = _utc(now or now_utc())
     dispatched: list[Mission] = []
 
     _handle_offline_flying_missions(db, t_now, fleet_cfg, energy_cfg)
+    if weather_check:
+        mid_flight_check(db, t_now, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
 
     while True:
         active = list(
@@ -565,13 +716,13 @@ def dispatch_tick(
                 start_pos=m_start.pos,
                 cfg=energy_cfg,
             )
-            m_end = _utc(m.started_at) + timedelta(seconds=est.duration_s)
+            m_end = _utc(m.started_at) + sim_delta(est.duration_s, energy_cfg)
             if m_end <= t_now:
                 ready_missions.append((m_end, m))
         ready_missions.sort(key=lambda pair: (pair[0], pair[1].id))
         earliest_m_end, earliest_m = ready_missions[0] if ready_missions else (None, None)
 
-        queued = [t for t in list_tasks(db, TaskStatus.queued) if _utc(t.queued_at) <= t_now]
+        queued = [t for t in list_pending_tasks(db) if _utc(t.queued_at) <= t_now]
         avail_times: list[datetime] = []
         if queued:
             probe_t = min(_utc(t.queued_at) for t in queued)
@@ -613,6 +764,7 @@ def dispatch_tick(
     return dispatched
 
 
+@_locked
 def enqueue_report(
     db: Session,
     report_or_id: Report | int,
@@ -629,7 +781,7 @@ def enqueue_report(
         raise conflict(f"Report {report.id} is {report.status.value} and cannot be queued")
 
     dist_from_base = haversine_m((fleet_cfg.base_lat, fleet_cfg.base_lon), (report.lat, report.lon))
-    if dist_from_base > fleet_cfg.service_radius_m + 1e-3:
+    if dist_from_base > fleet_cfg.service_radius_m + fleet_cfg.area_epsilon_m:
         raise OutOfServiceAreaError(
             f"Target ({report.lat:.5f}, {report.lon:.5f}) is {dist_from_base:.0f} m from base, "
             f"outside the {fleet_cfg.service_radius_m:.0f} m service area"
@@ -639,7 +791,7 @@ def enqueue_report(
     if existing is not None:
         return existing
 
-    open_tasks = [t for t in list_tasks(db) if t.status in (TaskStatus.queued, TaskStatus.dispatched)]
+    open_tasks = [t for t in list_tasks(db) if t.status in (*_PENDING, TaskStatus.dispatched)]
     nearby: list[tuple[float, InspectionTask]] = []
     for t in open_tasks:
         d = haversine_m((t.lat, t.lon), (report.lat, report.lon))
@@ -650,6 +802,7 @@ def enqueue_report(
         target_task = nearby[0][1]
         if report.id not in target_task.report_ids:
             target_task.report_ids.append(report.id)
+        target_task.priority = max(target_task.priority, report_priority(report))
         if target_task.status == TaskStatus.dispatched:
             report.status = ReportStatus.uav_dispatched
         save_task(db, target_task, commit=True)
@@ -664,6 +817,7 @@ def enqueue_report(
         created_at=t_now,
         queued_at=t_now,
         report_ids=[report.id],
+        priority=report_priority(report),
     )
     save_task(db, task, commit=not auto_dispatch)
     if auto_dispatch:
@@ -672,6 +826,7 @@ def enqueue_report(
     return task
 
 
+@_locked
 def cancel_task(
     db: Session,
     task_or_report_id: int,
@@ -681,17 +836,19 @@ def cancel_task(
     task = get_task(db, task_or_report_id) or get_task_for_report(db, task_or_report_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Inspection task {task_or_report_id} not found")
-    if task.status != TaskStatus.queued:
-        raise conflict(f"Task {task.task_id} is {task.status.value}; only a queued task can be cancelled")
+    if task.status not in _PENDING:
+        raise conflict(f"Task {task.task_id} is {task.status.value}; only a queued or held task can be cancelled")
     task.status = TaskStatus.cancelled
     task.decided_by = "monitor"
     task.failure_reason = reason
+    _clear_hold(task)
     save_task(db, task)
     _sync_task_report_statuses(db, task, ReportStatus.rejected, review_note=reason)
     db.commit()
     return task
 
 
+@_locked
 def recall_mission(
     db: Session,
     mission_id: int,
@@ -700,8 +857,12 @@ def recall_mission(
     *,
     fleet_cfg: FleetConfig = FLEET,
     energy_cfg: EnergyConfig = ENERGY,
+    code: str = "monitor_recall",
+    action: str = "recall",
 ) -> Mission:
-    """Monitor override: recall a flying drone, return it to base, and requeue/reassign its task (S7)."""
+    """Recall a flying drone, return it to base, and requeue/reassign its task (S7).
+
+    Called by the monitor (default) and by `safety.mid_flight_check` (`code` = the weather reason)."""
     t_now = _utc(now or now_utc())
     mission = get_or_404(db, Mission, mission_id, "Mission")
     if mission.state not in FLYING_STATES or mission.started_at is None:
@@ -714,8 +875,8 @@ def recall_mission(
         start_pos=m_start.pos,
         cfg=energy_cfg,
     )
-    elapsed_s = max(0.0, (t_now - _utc(mission.started_at)).total_seconds())
-    if elapsed_s >= est.duration_s:
+    elapsed_s = max(0.0, sim_elapsed_s(_utc(mission.started_at), t_now, energy_cfg))
+    if elapsed_s >= est.duration_s - energy_cfg.time_epsilon_s:
         raise conflict(f"Mission {mission_id} has already finished flying")
 
     base = (fleet_cfg.base_lat, fleet_cfg.base_lon, fleet_cfg.base_alt_m)
@@ -736,9 +897,20 @@ def recall_mission(
     mission.state = MissionState.failed
     mission.finished_at = t_now
     mission.flight_plan.decision_reason = reason
+    log_decision(
+        db,
+        action,
+        code,
+        f"{mission.flight_plan.drone_id} recalled: {reason}",
+        at=t_now,
+        drone_id=mission.flight_plan.drone_id,
+        report_id=mission.report_id,
+    )
 
-    _requeue_mission_task(db, mission, t_now, decided_by="monitor", reason=reason)
-    dispatch_tick(db, t_now, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
+    _requeue_mission_task(
+        db, mission, t_now, decided_by="monitor" if code == "monitor_recall" else "system", reason=reason
+    )
+    dispatch_tick(db, t_now, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg, weather_check=False)
     db.commit()
     db.refresh(mission)
     return mission

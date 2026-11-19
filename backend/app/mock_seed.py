@@ -26,6 +26,7 @@ from app.models import AppMeta, Detection, FlightPlan, Mission, MissionState, Pl
 from app.routers.common import edge_detection_row, now_utc
 from app.services.flight_planner import FlightPlanner
 from app.services.mock_detector import image_size
+from app.services.simclock import sim_delta
 from config import INFER, MOCK, PATHS, MockConfig
 from sim.mock_flight import flight_duration_s
 
@@ -161,7 +162,8 @@ def _seed_report(db: Session, spec: dict, now: datetime, planner: FlightPlanner,
         m = p.get("mission")
         if m is None:
             continue
-        started = _ago(now, seconds=m["started_s_ago"]) if "started_s_ago" in m else None
+        # started_s_ago is simulated seconds in flight, so it is converted with the time scale
+        started = now - sim_delta(m["started_s_ago"]) if "started_s_ago" in m else None
         mission = Mission(flight_plan_id=plan.id, report_id=report.id, state=MissionState.pending, started_at=started)
         if started is not None:
             duration = flight_duration_s(plan.route, cfg)
@@ -170,7 +172,7 @@ def _seed_report(db: Session, spec: dict, now: datetime, planner: FlightPlanner,
                 updated = max(updated, started)
             else:
                 mission.state = MissionState.done
-                mission.finished_at = started + timedelta(seconds=duration)
+                mission.finished_at = started + sim_delta(duration)
                 updated = max(updated, mission.finished_at)
         db.add(mission)
         db.flush()

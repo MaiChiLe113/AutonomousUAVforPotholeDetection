@@ -3,6 +3,7 @@
 import type { Map as LeafletMap } from "leaflet";
 import type { ReactNode } from "react";
 
+import { MAP } from "./config";
 import type { Waypoint, WaypointAction } from "./types";
 
 /** [lat, lon] in degrees. */
@@ -36,6 +37,29 @@ export interface MapUav {
   headingDeg: number; // 0 = north, clockwise
   label?: string;
 }
+
+/** One UAV of the fleet (MapViewProps.uavs). Colour defaults to MAP.colors.uav. */
+export interface MapFleetUav extends MapUav {
+  id: string;
+  color?: string;
+}
+
+/** The UAV base (MapViewProps.stations). */
+export interface MapStation {
+  id: string | number;
+  position: LatLng;
+  label?: string;
+}
+
+/** The district service area, drawn as a dashed circle. */
+export interface MapServiceArea {
+  center: LatLng;
+  radiusM: number;
+  label?: string;
+}
+
+/** [[south, west], [north, east]]. */
+export type MapBounds = [LatLng, LatLng];
 
 export interface MapCircle {
   center: LatLng;
@@ -90,6 +114,18 @@ export interface MapViewProps {
   homeLine?: boolean;
   /** Arrow marker rotated by heading. */
   uav?: MapUav | null;
+  /** Several UAVs (the fleet). `follow` tracks the selected one (selectedUavId) when `uav` is not set. */
+  uavs?: MapFleetUav[];
+  selectedUavId?: string | null;
+  onUavClick?: (id: string) => void;
+  /** Dashed service-area circle (the 2 km district). */
+  serviceArea?: MapServiceArea | null;
+  /** Base markers (the UAV station). */
+  stations?: MapStation[];
+  /** The map cannot be panned outside these bounds (see districtBounds / DISTRICT_VIEW). */
+  maxBounds?: MapBounds;
+  /** Lowest zoom level (keeps the map on the district). */
+  minZoom?: number;
   /** Cone from the UAV in the gimbal yaw direction (needs uav). */
   cameraFootprint?: CameraFootprint | null;
 
@@ -105,6 +141,8 @@ export interface MapViewProps {
    * "Fit route" button: setFitKey((k) => k + 1). Fit once data loads: fitKey={plan?.id}.
    */
   fitKey?: string | number | null;
+  /** When set, `fitKey` fits these bounds (e.g. the service area) instead of every overlay. The first fit is instant. */
+  fitBoundsTo?: MapBounds;
   /** Offset fly / fit / follow so targets are not hidden by the FloatingPanel. Default true. */
   avoidPanel?: boolean;
   /** Escape hatch: the Leaflet map instance, once. */
@@ -164,6 +202,38 @@ export function destinationPoint(from: LatLng, bearingDeg: number, distanceM: nu
   const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d) + Math.cos(lat1) * Math.sin(d) * Math.cos(b));
   const lon2 = lon1 + Math.atan2(Math.sin(b) * Math.sin(d) * Math.cos(lat1), Math.cos(d) - Math.sin(lat1) * Math.sin(lat2));
   return [deg(lat2), deg(lon2)];
+}
+
+/** Bounds of a circle (plus padding) around `center`: the area a map is clamped to. */
+export function circleBounds(center: LatLng, radiusM: number, paddingM = 0): MapBounds {
+  const r = radiusM + paddingM;
+  return [
+    [destinationPoint(center, 180, r)[0], destinationPoint(center, 270, r)[1]],
+    [destinationPoint(center, 0, r)[0], destinationPoint(center, 90, r)[1]],
+  ];
+}
+
+const DISTRICT_CENTER = MAP.district.center;
+
+/** Map props that clamp a map to the district (spread onto <MapView>): bounds, min zoom, the 2 km circle and base. */
+export const DISTRICT_VIEW = {
+  maxBounds: circleBounds(DISTRICT_CENTER, MAP.district.radiusM, MAP.district.boundsPaddingM),
+  minZoom: MAP.district.minZoom,
+} satisfies Pick<MapViewProps, "maxBounds" | "minZoom">;
+
+/** Service-area circle from the configured district (the live one comes from GET /fleet). */
+export const DISTRICT_SERVICE_AREA: MapServiceArea = {
+  center: DISTRICT_CENTER,
+  radiusM: MAP.district.radiusM,
+  label: MAP.district.name,
+};
+
+/** The UAV base at the district centre (the live position comes from GET /fleet). */
+export const DISTRICT_STATIONS: MapStation[] = [{ id: "base", position: DISTRICT_CENTER, label: "UAV base" }];
+
+/** True when `p` is inside the service area (circle of `radiusM` around `center`). Defaults to the configured district. */
+export function isInServiceArea(p: LatLng, center: LatLng = DISTRICT_CENTER, radiusM: number = MAP.district.radiusM): boolean {
+  return haversineM(p, center) <= radiusM;
 }
 
 /** Normalise any angle to 0-360. */

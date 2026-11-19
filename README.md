@@ -114,6 +114,8 @@ npm run dev
 
 Open http://localhost:3000. Pages: `/report` (resident), `/monitor` (report queue), `/monitor/dashboard`.
 
+The monitor **Simulator** tab embeds the standalone RDMO Unity WebGL simulator (MIT, not connected to our fleet). Fetch it once with `bash frontend/scripts/fetch-rdmo.sh` (about 187 MB into the gitignored `frontend/public/rdmo/`).
+
 ## 8. Everything with Docker
 
 ```bash

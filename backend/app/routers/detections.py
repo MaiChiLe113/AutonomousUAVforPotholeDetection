@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import Detection, Report
+from app.routers.auth import require_monitor
 from app.routers.common import get_or_404
 from app.schemas import DetectionOut, FlagIn
 
@@ -21,7 +22,7 @@ def list_detections(report_id: int, db: Session = Depends(get_db)) -> list[Detec
     return list(db.scalars(select(Detection).where(Detection.report_id == report_id).order_by(Detection.id)).all())
 
 
-@router.post("/detections/{detection_id}/flag", response_model=DetectionOut)
+@router.post("/detections/{detection_id}/flag", response_model=DetectionOut, dependencies=[Depends(require_monitor)])
 def flag_detection(detection_id: int, body: FlagIn, db: Session = Depends(get_db)) -> Detection:
     """Mark as wrong; feeds the corrections-rate retraining trigger (§3.2). SCRUM-37."""
     detection = get_or_404(db, Detection, detection_id, "Detection")

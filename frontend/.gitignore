@@ -40,3 +40,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# RDMO WebGL simulator (fetched by scripts/fetch-rdmo.sh, large binaries)
+/public/rdmo/

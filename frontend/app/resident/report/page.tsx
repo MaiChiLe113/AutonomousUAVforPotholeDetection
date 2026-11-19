@@ -22,7 +22,15 @@ import {
 } from "@/components/ui";
 import { ApiError, createReport } from "@/lib/api";
 import { MAP, RESIDENT_ROUTES } from "@/lib/config";
-import type { FlyTarget, LatLng } from "@/lib/map";
+import {
+  DISTRICT_SERVICE_AREA,
+  DISTRICT_STATIONS,
+  DISTRICT_VIEW,
+  formatDistance,
+  isInServiceArea,
+  type FlyTarget,
+  type LatLng,
+} from "@/lib/map";
 import { addMyReport } from "@/lib/session";
 import type { Report } from "@/lib/types";
 
@@ -38,6 +46,8 @@ export default function NewReportPage() {
   const [fly, setFly] = useState<FlyTarget | null>({ center: MAP.defaultCenter, key: 0 });
   const flySeq = useRef(0);
   const pinTouched = useRef(false);
+  // The browser location is outside the district: the pin stays where it is (the map cannot show that place).
+  const [locationOutside, setLocationOutside] = useState(false);
 
   /** Ask the browser for its location. `force`: also move a pin the resident already placed. */
   const locate = (force: boolean) => {
@@ -45,6 +55,9 @@ export default function NewReportPage() {
     return requestLocation()
       .then(
         (pos) => {
+          const inDistrict = isInServiceArea(pos, MAP.district.center, MAP.district.radiusM + MAP.district.boundsPaddingM);
+          setLocationOutside(!inDistrict);
+          if (!inDistrict) return;
           if (!force && pinTouched.current) return;
           pinTouched.current = false;
           setPin(pos);
@@ -103,10 +116,14 @@ export default function NewReportPage() {
   }
 
   const pinPosition: LatLng = created ? [created.lat, created.lon] : pin;
+  const pinOutside = !isInServiceArea(pinPosition);
 
   return (
     <>
       <MapView
+        {...DISTRICT_VIEW}
+        serviceArea={DISTRICT_SERVICE_AREA}
+        stations={DISTRICT_STATIONS}
         pin={{ position: pinPosition, draggable: editable, label: created ? `Report #${created.id}` : undefined }}
         onPinMove={movePin}
         onMapClick={editable ? movePin : undefined}
@@ -159,8 +176,14 @@ export default function NewReportPage() {
                   <Icon name="pin" size={14} />
                   {formatLatLng(pin)}
                 </span>
-                <PinNote source={pinSource} locating={locating} />
+                <PinNote source={pinSource} locating={locating} locationOutside={locationOutside} />
               </p>
+              {pinOutside && (
+                <Banner tone="warning" title="Outside the service area" className="mt-2">
+                  UAVs only inspect within {formatDistance(MAP.district.radiusM)} of the base, so a UAV will not check this spot. You can still send
+                  the report.
+                </Banner>
+              )}
             </PanelSection>
             <PanelSection title="2 · Add a photo">
               <PhotoPicker
@@ -180,7 +203,7 @@ export default function NewReportPage() {
 }
 
 /** Quiet hint about the pin. A denied or failed location lookup is not an error: the map centre is used. */
-function PinNote({ source, locating }: { source: PinSource; locating: boolean }) {
+function PinNote({ source, locating, locationOutside }: { source: PinSource; locating: boolean; locationOutside: boolean }) {
   if (source === "user") return <span>Placed by you</span>;
   if (locating) {
     return (
@@ -190,5 +213,6 @@ function PinNote({ source, locating }: { source: PinSource; locating: boolean })
     );
   }
   if (source === "location") return <span>Your location</span>;
+  if (locationOutside) return <span>Your location is outside the district – move the pin to the pothole</span>;
   return <span>Location not available – move the pin to the pothole</span>;
 }

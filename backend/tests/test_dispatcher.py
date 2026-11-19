@@ -32,6 +32,7 @@ from app.services.flight_planner import FlightPlanner
 from config import ENERGY, FLEET
 from sim.energy import estimate
 
+MONITOR_HEADERS = {"X-Role": "monitor"}  # control endpoints need the monitor role
 _MEDIA = Path(__file__).resolve().parents[1] / "mock" / "media"
 
 
@@ -229,7 +230,7 @@ def test_s7_monitor_recalls_flying_drone_and_requeues_task(db_session: Session):
 
 
 def test_s7_api_recall_and_cancel_endpoints():
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(), headers=MONITOR_HEADERS) as client:
         assert client.post("/dev/reset").status_code == 200
 
         created_ids = []

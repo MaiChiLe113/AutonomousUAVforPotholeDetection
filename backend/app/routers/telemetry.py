@@ -16,6 +16,7 @@ from config import UAV
 router = APIRouter(prefix="/telemetry", tags=["telemetry"])
 
 
+# Not role-guarded on purpose: the drone app posts here and has no monitor role.
 @router.post("/ingest", response_model=TelemetryOut, status_code=201)
 def ingest(body: DroneTelemetryIn, db: Session = Depends(get_db)) -> UavTelemetry:
     """Store one raw drone message on the drone's active (flying) mission, found by droneID.

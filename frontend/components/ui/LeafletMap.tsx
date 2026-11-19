@@ -20,7 +20,7 @@ import {
 } from "react-leaflet";
 
 import { MAP } from "@/lib/config";
-import { destinationPoint, normalizeDeg, type FlyTarget, type LatLng, type MapViewProps } from "@/lib/map";
+import { destinationPoint, normalizeDeg, type FlyTarget, type LatLng, type MapBounds, type MapViewProps } from "@/lib/map";
 
 // ------------------------------------------------------------------ icons (divIcon, no CDN images)
 
@@ -66,15 +66,15 @@ function pinIcon(color: string, draggable: boolean) {
   );
 }
 
-function uavIcon(headingDeg: number) {
+function uavIcon(headingDeg: number, colorIn?: string, selected = false) {
   const h = Math.round(normalizeDeg(headingDeg) / 2) * 2;
-  const color = MAP.colors.uav;
-  return cachedIcon(`uav|${h}`, () =>
+  const color = safeColor(colorIn, MAP.colors.uav);
+  return cachedIcon(`uav|${h}|${color}|${selected}`, () =>
     L.divIcon({
       className: "map-icon",
       html:
         `<svg class="map-uav" viewBox="0 0 40 40" style="transform:rotate(${h}deg)" aria-hidden="true">` +
-        `<circle cx="20" cy="20" r="18" fill="${color}" fill-opacity="0.16"/>` +
+        `<circle cx="20" cy="20" r="18" fill="${color}" fill-opacity="${selected ? 0.3 : 0.16}"${selected ? ` stroke="${color}" stroke-width="2"` : ""}/>` +
         `<path d="M20 5 L30 32 L20 26 L10 32 Z" fill="${color}" stroke="#fff" stroke-width="2.5" stroke-linejoin="round"/></svg>`,
       iconSize: [40, 40],
       iconAnchor: [20, 20],
@@ -86,6 +86,17 @@ function uavIcon(headingDeg: number) {
 const homeIcon = () =>
   cachedIcon("home", () =>
     L.divIcon({ className: "map-icon", html: `<span class="map-home">H</span>`, iconSize: [22, 22], iconAnchor: [11, 11] }),
+  );
+
+const stationIcon = () =>
+  cachedIcon("station", () =>
+    L.divIcon({
+      className: "map-icon",
+      html: `<span class="map-station" style="background:${MAP.colors.base}">B</span>`,
+      iconSize: [26, 26],
+      iconAnchor: [13, 13],
+      tooltipAnchor: [0, -13],
+    }),
   );
 
 // takeoff / land are drawn as badges beside the point when they share a spot (they usually do: home).
@@ -155,14 +166,16 @@ interface BehaviourProps {
   uavPos: LatLng | null;
   fitKey?: string | number | null;
   fitPoints: LatLng[];
+  fitBoundsTo?: MapBounds;
   avoidPanel: boolean;
 }
 
-function MapBehaviour({ onMapClick, onUserMove, onReady, flyTo, follow, uavPos, fitKey, fitPoints, avoidPanel }: BehaviourProps) {
+function MapBehaviour({ onMapClick, onUserMove, onReady, flyTo, follow, uavPos, fitKey, fitPoints, fitBoundsTo, avoidPanel }: BehaviourProps) {
   const map = useMap();
-  const latest = useRef({ onMapClick, onUserMove, fitPoints, avoidPanel });
+  const latest = useRef({ onMapClick, onUserMove, fitPoints, fitBoundsTo, avoidPanel });
+  const fitted = useRef(false);
   useEffect(() => {
-    latest.current = { onMapClick, onUserMove, fitPoints, avoidPanel };
+    latest.current = { onMapClick, onUserMove, fitPoints, fitBoundsTo, avoidPanel };
   });
 
   useMapEvents({
@@ -207,9 +220,21 @@ function MapBehaviour({ onMapClick, onUserMove, onReady, flyTo, follow, uavPos, 
   // fitKey: fit every overlay when the key changes.
   useEffect(() => {
     if (fitKey === null || fitKey === undefined) return;
-    const { fitPoints: pts, avoidPanel: avoid } = latest.current;
-    if (pts.length === 0) return;
+    const { fitPoints: pts, fitBoundsTo: target, avoidPanel: avoid } = latest.current;
     const insets = panelInsets(map, avoid);
+    if (target) {
+      // Fit the given bounds (the service area): instant the first time, so the map opens already fitted.
+      map.invalidateSize({ pan: false });
+      const pad = MAP.fitPaddingPx;
+      map.fitBounds(L.latLngBounds(target), {
+        paddingTopLeft: [pad + insets.left, pad],
+        paddingBottomRight: [pad, pad + insets.bottom],
+        animate: fitted.current,
+      });
+      fitted.current = true;
+      return;
+    }
+    if (pts.length === 0) return;
     if (pts.length === 1) {
       const zoom = Math.max(map.getZoom(), MAP.focusZoom);
       map.flyTo(offsetCenter(map, pts[0], zoom, insets), zoom, { duration: MAP.flyDurationS });
@@ -267,12 +292,20 @@ export default function LeafletMap({
   home = null,
   homeLine = false,
   uav = null,
+  uavs,
+  selectedUavId = null,
+  onUavClick,
+  serviceArea = null,
+  stations,
+  maxBounds,
+  minZoom,
   cameraFootprint = null,
   onMapClick,
   flyTo = null,
   follow = false,
   onUserMove,
   fitKey = null,
+  fitBoundsTo,
   avoidPanel = true,
   onReady,
   children,
@@ -311,6 +344,8 @@ export default function LeafletMap({
     [uav, cameraFootprint],
   );
 
+  const followPos = uav?.position ?? uavs?.find((u) => u.id === selectedUavId)?.position ?? null;
+
   const fitPoints = useMemo<LatLng[]>(() => {
     const pts: LatLng[] = [];
     if (route) pts.push(...route);
@@ -321,13 +356,16 @@ export default function LeafletMap({
     if (pin) pts.push(pin.position);
     if (home) pts.push(home);
     if (uav) pts.push(uav.position);
-    if (circle) {
-      const r = circle.radiusM;
-      pts.push(destinationPoint(circle.center, 0, r), destinationPoint(circle.center, 180, r));
-      pts.push(destinationPoint(circle.center, 90, r), destinationPoint(circle.center, 270, r));
+    if (uavs) pts.push(...uavs.map((u) => u.position));
+    if (stations) pts.push(...stations.map((st) => st.position));
+    for (const area of [circle, serviceArea]) {
+      if (!area) continue;
+      const r = area.radiusM;
+      pts.push(destinationPoint(area.center, 0, r), destinationPoint(area.center, 180, r));
+      pts.push(destinationPoint(area.center, 90, r), destinationPoint(area.center, 270, r));
     }
     return pts;
-  }, [route, plannedRoute, trail, waypoints, markers, pin, home, uav, circle]);
+  }, [route, plannedRoute, trail, waypoints, markers, pin, home, uav, uavs, stations, circle, serviceArea]);
 
   const c = MAP.colors;
 
@@ -336,6 +374,9 @@ export default function LeafletMap({
       center={center}
       zoom={zoom}
       maxZoom={MAP.maxZoom}
+      minZoom={minZoom}
+      maxBounds={maxBounds}
+      maxBoundsViscosity={maxBounds ? MAP.district.boundsViscosity : undefined}
       zoomControl={false}
       attributionControl={false}
       className="h-full w-full"
@@ -351,11 +392,21 @@ export default function LeafletMap({
         onReady={onReady}
         flyTo={flyTo}
         follow={follow}
-        uavPos={uav?.position ?? null}
+        uavPos={followPos}
         fitKey={fitKey}
         fitPoints={fitPoints}
+        fitBoundsTo={fitBoundsTo}
         avoidPanel={avoidPanel}
       />
+
+      {serviceArea && (
+        <Circle
+          center={serviceArea.center}
+          radius={serviceArea.radiusM}
+          interactive={false}
+          pathOptions={{ color: MAP.district.serviceColor, weight: 2, opacity: 0.7, dashArray: "8 8", fillOpacity: 0.03 }}
+        />
+      )}
 
       {circle && (
         <Circle
@@ -422,6 +473,14 @@ export default function LeafletMap({
         </Marker>
       )}
 
+      {stations?.map((st) => (
+        <Marker key={`station-${st.id}`} position={st.position} icon={stationIcon()} alt={st.label ?? "Base"} zIndexOffset={150}>
+          <Tooltip direction="top" offset={[0, -6]}>
+            {st.label ?? "UAV base"}
+          </Tooltip>
+        </Marker>
+      ))}
+
       {markers.map((m) => {
         const selected = m.id === selectedId;
         return (
@@ -459,6 +518,23 @@ export default function LeafletMap({
           {uav.label && <Tooltip direction="top">{uav.label}</Tooltip>}
         </Marker>
       )}
+
+      {uavs?.map((u) => {
+        const selected = u.id === selectedUavId;
+        return (
+          <Marker
+            key={`uav-${u.id}`}
+            position={u.position}
+            icon={uavIcon(u.headingDeg, u.color, selected)}
+            title={u.label ? undefined : u.id}
+            alt={u.label ?? u.id}
+            zIndexOffset={selected ? 2100 : 1900}
+            eventHandlers={onUavClick ? { click: () => onUavClick(u.id) } : undefined}
+          >
+            {u.label && <Tooltip direction="top">{u.label}</Tooltip>}
+          </Marker>
+        );
+      })}
 
       {children}
     </MapContainer>

@@ -1,6 +1,6 @@
 "use client";
 
-// Full-bleed Leaflet map (CARTO Voyager tiles). Safe to import from any client page: the Leaflet
+// Full-bleed Leaflet map (OpenStreetMap tiles, MAP.tileUrl). Safe to import from any client page: the Leaflet
 // code loads in the browser only (next/dynamic, ssr: false), so no extra dynamic() is needed.
 //
 //   <main> (relative)                                  <- AppShell provides this
@@ -12,6 +12,8 @@
 //   overlays   markers (+selectedId, onMarkerClick), pin (+onPinMove when draggable), route (solid),
 //              plannedRoute (dashed), waypoints, highlightWaypoint, trail, circle, home (+homeLine),
 //              uav (rotated by headingDeg), cameraFootprint
+//   district   serviceArea (dashed circle), stations (base marker), uavs[] (+selectedUavId, onUavClick),
+//              maxBounds + minZoom (clamp the map to the district; spread DISTRICT_VIEW from lib/map)
 //   behaviour  onMapClick, flyTo (flies when the value changes), follow (+onUserMove on drag),
 //              fitKey (fit all overlays when it changes), avoidPanel (default true), onReady(map)
 
@@ -24,9 +26,13 @@ export type {
   CameraFootprint,
   FlyTarget,
   LatLng,
+  MapBounds,
   MapCircle,
+  MapFleetUav,
   MapMarker,
   MapPin,
+  MapServiceArea,
+  MapStation,
   MapUav,
   MapViewProps,
   MapWaypoint,

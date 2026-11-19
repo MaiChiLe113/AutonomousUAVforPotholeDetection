@@ -18,6 +18,8 @@ from app.services.fleet import (
     get_mission_start,
 )
 from app.services.flight_planner import FlightPlanner, OutOfServiceAreaError, extract_route_targets
+from app.services.safety import LaunchPoint, SafetyGate
+from app.services.simclock import sim_delta, sim_elapsed_s
 from config import ENERGY, FLEET, SCENARIOS, EnergyConfig, FleetConfig, ScenarioConfig
 from sim.energy import destination, estimate, haversine_m
 
@@ -30,6 +32,11 @@ _GROUND_ALT_EPS_M = 0.1
 
 def _utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _task_order(task: InspectionTask) -> tuple[int, datetime, int]:
+    """Highest priority first, then oldest, then task id."""
+    return (-task.priority, _utc(task.created_at), task.task_id)
 
 
 def _at_base_ground(pt: tuple[float, float, float], base: tuple[float, float, float]) -> bool:
@@ -104,6 +111,7 @@ class Allocator(Protocol):
         *,
         fleet_cfg: FleetConfig = FLEET,
         energy_cfg: EnergyConfig = ENERGY,
+        gate: SafetyGate | None = None,
     ) -> list[Bid]: ...
 
 
@@ -121,10 +129,12 @@ class BaselineAllocator:
         *,
         fleet_cfg: FleetConfig = FLEET,
         energy_cfg: EnergyConfig = ENERGY,
+        gate: SafetyGate | None = None,
     ) -> list[Bid]:
-        del db, now
+        gate = gate or SafetyGate(db, now, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
+        energy_cfg = gate.energy_cfg  # wind-adjusted reserve checks
         planner = FlightPlanner(energy=energy_cfg, fleet=fleet_cfg)
-        ordered = sorted(tasks, key=lambda t: (_utc(t.created_at), t.task_id))
+        ordered = sorted(tasks, key=_task_order)
         available = [(order, d) for order, d in enumerate(fleet) if d.status == DroneStatus.idle]
         bids: list[Bid] = []
 
@@ -143,6 +153,8 @@ class BaselineAllocator:
                 except OutOfServiceAreaError:
                     best = None
                     break
+                if not gate.check(drone, task):
+                    continue
                 if drone.battery_pct - rth.estimated_battery_pct < energy_cfg.reserve_pct:
                     continue
                 dist_m = haversine_m(drone.position[:2], (task.lat, task.lon))
@@ -327,8 +339,8 @@ def _project_drone(
         start_pos=m_start.pos,
         cfg=energy_cfg,
     )
-    m_end = _utc(mission.started_at) + timedelta(seconds=est.duration_s)
-    rem_s = max(0.0, (m_end - t_now).total_seconds())
+    m_end = _utc(mission.started_at) + sim_delta(est.duration_s, energy_cfg)
+    rem_s = max(0.0, sim_elapsed_s(t_now, m_end, energy_cfg))
     end_pt = est.legs[-1].end
     end_bat = est.end_battery_pct
     base_t, base_bat = _base_recovery(rem_s, end_pt, end_bat, base, energy_cfg)
@@ -348,7 +360,7 @@ def _project_drone(
     )
     proj = _ProjectedDrone(d.drone_id, order, rem_s, end_pt, end_bat, base, base_t, base_bat, rem_home_at_end)
     if re_tasking:
-        elapsed_s = max(0.0, (t_now - _utc(mission.started_at)).total_seconds())
+        elapsed_s = max(0.0, sim_elapsed_s(_utc(mission.started_at), t_now, energy_cfg))
         cur_phase, rem_targets = _remaining_targets_for_mission(
             mission.flight_plan.route,
             elapsed_s,
@@ -384,6 +396,7 @@ def _bid_from_state(
     energy_cfg: EnergyConfig,
     *,
     rem_to_base_s: float = 0.0,
+    gate: SafetyGate | None = None,
 ) -> Bid | None:
     try:
         rth = planner.propose(
@@ -395,6 +408,9 @@ def _bid_from_state(
             return_to_home=True,
         )
     except OutOfServiceAreaError:
+        return None
+    # Only a launch happening now is gated: a projected launch is checked again when it really happens.
+    if gate is not None and use_t <= 0.0 and not gate.check(LaunchPoint(proj.drone_id, use_pos, use_bat), task):
         return None
     if use_bat - rth.estimated_battery_pct < energy_cfg.reserve_pct:
         return None
@@ -423,9 +439,14 @@ def _mid_leg_insertion_bid(
     planner: FlightPlanner,
     fleet_cfg: FleetConfig,
     energy_cfg: EnergyConfig,
+    gate: SafetyGate | None = None,
 ) -> Bid | None:
     if not proj.can_mid_leg_insert or proj.live_pos is None or proj.active_mission_id is None:
         return None
+    if gate is not None:
+        flying = LaunchPoint(proj.drone_id, proj.live_pos, proj.live_bat, DroneStatus.flying)
+        if not gate.check(flying, task):
+            return None
     tgt = (task.lat, task.lon)
     near_route = haversine_m(proj.live_pos[:2], tgt) <= fleet_cfg.multi_stop_radius_m or any(
         haversine_m(stop, tgt) <= fleet_cfg.multi_stop_radius_m for stop in proj.rem_targets
@@ -491,9 +512,10 @@ def _candidate_bid(
     energy_cfg: EnergyConfig,
     *,
     re_tasking: bool = False,
+    gate: SafetyGate | None = None,
 ) -> Bid | None:
     if re_tasking and proj.can_mid_leg_insert:
-        splice_bid = _mid_leg_insertion_bid(task, proj, planner, fleet_cfg, energy_cfg)
+        splice_bid = _mid_leg_insertion_bid(task, proj, planner, fleet_cfg, energy_cfg, gate)
         if splice_bid is not None:
             return splice_bid
     direct = _bid_from_state(
@@ -505,11 +527,14 @@ def _candidate_bid(
         planner,
         energy_cfg,
         rem_to_base_s=proj.rem_to_base_s,
+        gate=gate,
     )
     if direct is not None:
         return direct
     if (proj.at_base_after_s, proj.base, proj.at_base_bat) != (proj.free_in_s, proj.pos, proj.battery_pct):
-        return _bid_from_state(task, proj, proj.at_base_after_s, proj.base, proj.at_base_bat, planner, energy_cfg)
+        return _bid_from_state(
+            task, proj, proj.at_base_after_s, proj.base, proj.at_base_bat, planner, energy_cfg, gate=gate
+        )
     return None
 
 
@@ -580,7 +605,10 @@ class AuctionAllocator:
         *,
         fleet_cfg: FleetConfig = FLEET,
         energy_cfg: EnergyConfig = ENERGY,
+        gate: SafetyGate | None = None,
     ) -> list[Bid]:
+        gate = gate or SafetyGate(db, now, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
+        energy_cfg = gate.energy_cfg  # wind-adjusted reserve checks
         active_retask = self.re_tasking or fleet_cfg.re_tasking
         planner = FlightPlanner(energy=energy_cfg, fleet=fleet_cfg)
         projected = [
@@ -591,20 +619,29 @@ class AuctionAllocator:
         if not projected or not tasks:
             return []
 
-        unassigned = sorted(tasks, key=lambda t: (_utc(t.created_at), t.task_id))
+        unassigned = sorted(tasks, key=_task_order)
         immediate_bids: list[Bid] = []
 
         while unassigned:
             best_pair: (
-                tuple[tuple[float, float, datetime, int, int], InspectionTask, _ProjectedDrone, Bid] | None
+                tuple[tuple[int, float, float, datetime, int, int], InspectionTask, _ProjectedDrone, Bid] | None
             ) = None
             for task in unassigned:
                 for proj in projected:
-                    bid = _candidate_bid(task, proj, planner, fleet_cfg, energy_cfg, re_tasking=active_retask)
+                    bid = _candidate_bid(
+                        task, proj, planner, fleet_cfg, energy_cfg, re_tasking=active_retask, gate=gate
+                    )
                     if bid is None:
                         continue
                     primary_score = round(bid.insertion_cost_s, 4) if active_retask else round(bid.arrival_s, 4)
-                    key = (primary_score, round(bid.arrival_s, 4), _utc(task.created_at), task.task_id, proj.order)
+                    key = (
+                        -task.priority,
+                        primary_score,
+                        round(bid.arrival_s, 4),
+                        _utc(task.created_at),
+                        task.task_id,
+                        proj.order,
+                    )
                     if best_pair is None or key < best_pair[0]:
                         best_pair = (key, task, proj, bid)
 
@@ -749,7 +786,7 @@ def _total_battery_used(db: Session, fleet_cfg: FleetConfig, energy_cfg: EnergyC
             total += est.battery_used_pct + get_pre_splice_battery_used(db, m.id)
             end_pt = est.legs[-1].end
             if not _at_base_ground(end_pt, base):
-                m_end = _utc(m.started_at) + timedelta(seconds=est.duration_s)
+                m_end = _utc(m.started_at) + sim_delta(est.duration_s, energy_cfg)
                 chained = (
                     idx + 1 < len(missions)
                     and missions[idx + 1].started_at is not None
@@ -781,7 +818,9 @@ def run_scenario(
 ) -> ScenarioResult:
     """Run one seeded report arrival trace in memory with fast simulated clock."""
     from app.services.dispatcher import TaskStatus, dispatch_tick, enqueue_report, list_tasks
+    from app.services.safety import set_weather_override
 
+    energy_cfg = replace(energy_cfg, time_scale=1.0)  # the scenario clock is already simulated seconds
     drone_ids = tuple(f"sim-uav-{i + 1}" for i in range(n_drones))
     active_fleet = replace(fleet_cfg, drone_ids=drone_ids, allocator=allocator)
     arrivals = _generate_arrivals(
@@ -799,6 +838,7 @@ def run_scenario(
     t0 = datetime(2026, 11, 16, 10, 0, tzinfo=UTC)
 
     with local() as db:
+        set_weather_override(db, 0.0)  # scenarios compare allocators, not weather
         arrival_idx = 0
         cursor_s = 0.0
         while cursor_s <= sc_cfg.horizon_s:

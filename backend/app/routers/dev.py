@@ -7,13 +7,14 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.mock_seed import reset_and_seed
+from app.routers.auth import require_monitor
 from app.schemas import ResetOut
 from config import MOCK
 
 router = APIRouter(prefix="/dev", tags=["dev"])
 
 
-@router.post("/reset", response_model=ResetOut)
+@router.post("/reset", response_model=ResetOut, dependencies=[Depends(require_monitor)])
 def reset_demo(db: Session = Depends(get_db)) -> ResetOut:
     """Wipe the database and uploads, then reload backend/mock/seed.json. 404 when MOCK.enabled is off."""
     if not MOCK.enabled:

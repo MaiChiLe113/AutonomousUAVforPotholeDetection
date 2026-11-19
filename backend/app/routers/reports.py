@@ -11,9 +11,13 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import Detection, PlanStatus, Report, ReportStatus
 from app.routers import todo
+from app.routers.auth import require_monitor
 from app.routers.common import conflict, get_or_404, now_utc, sync_active_missions
 from app.schemas import ReportOut, ReportReview
+from app.services.dispatcher import enqueue_report
+from app.services.flight_planner import OutOfServiceAreaError
 from app.services.mock_detector import MockDetector
+from app.services.safety import log_decision
 from config import API, MOCK, PATHS
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -116,11 +120,12 @@ def get_report(report_id: int, db: Session = Depends(get_db)) -> Report:
     return get_or_404(db, Report, report_id, "Report")
 
 
-@router.patch("/{report_id}/review", response_model=ReportOut)
+@router.patch("/{report_id}/review", response_model=ReportOut, dependencies=[Depends(require_monitor)])
 def review_report(report_id: int, body: ReportReview, db: Session = Depends(get_db)) -> Report:
-    """Admin confirms (-> propose a flight plan) or rejects the report. SCRUM-29.
+    """Admin confirms (-> inspection queue) or rejects the report. SCRUM-29. Monitor role only.
 
-    Confirm keeps the report under_review (the next step is POST /reports/{id}/flight-plan).
+    Confirm keeps the report under_review and queues it (services.dispatcher.enqueue_report): a drone takes
+    it automatically as soon as the safety gate says go, otherwise the task is held with a reason.
     Reject needs a note (422 without one) and closes the report as rejected."""
     report = get_or_404(db, Report, report_id, "Report")
     if report.status != ReportStatus.under_review:
@@ -139,5 +144,11 @@ def review_report(report_id: int, body: ReportReview, db: Session = Depends(get_
                 plan.decided_at = now_utc()
     report.review_note = note
     db.commit()
+    if body.confirmed:
+        try:
+            enqueue_report(db, report)
+        except OutOfServiceAreaError as exc:  # confirmed, but no drone may fly there: leave a trace for the monitor
+            log_decision(db, "hold", "out_of_area", str(exc), at=now_utc(), report_id=report.id)
+            db.commit()
     db.refresh(report)
     return report

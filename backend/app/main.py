@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -12,8 +14,10 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.db import SessionLocal, init_db
-from app.routers import detections, dev, flight_plans, missions, monitoring, reports, telemetry
-from config import API, MOCK, PATHS
+from app.routers import detections, dev, fleet, flight_plans, missions, monitoring, reports, telemetry
+from config import API, FLEET, MOCK, PATHS
+
+logger = logging.getLogger(__name__)
 
 
 def _build_detector():
@@ -26,6 +30,24 @@ def _build_detector():
     return None
 
 
+def tick_once() -> int:
+    """One autonomous dispatch pass in its own session; returns how many missions it launched."""
+    from app.services.dispatcher import dispatch_tick
+
+    with SessionLocal() as db:
+        return len(dispatch_tick(db))
+
+
+async def _tick_loop(interval_s: float) -> None:
+    """Background autonomy: the fleet decides when to fly without any request (FLEET.tick_interval_s)."""
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await asyncio.to_thread(tick_once)
+        except Exception:  # keep the loop alive: one bad tick must not stop the fleet
+            logger.exception("dispatch tick failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -35,7 +57,14 @@ async def lifespan(app: FastAPI):
         with SessionLocal() as db:
             seed_on_start(db)  # seeds a missing/empty database only; restarts keep the demo data
     app.state.detector = _build_detector()
-    yield
+    ticker = asyncio.create_task(_tick_loop(FLEET.tick_interval_s)) if FLEET.auto_tick else None
+    app.state.ticker = ticker  # None when FLEET.auto_tick is off (tests)
+    try:
+        yield
+    finally:
+        if ticker is not None:
+            ticker.cancel()
+            await asyncio.gather(ticker, return_exceptions=True)
 
 
 async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -61,7 +90,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(RequestValidationError, _validation_error)
     app.mount("/media", StaticFiles(directory=PATHS.media_dir), name="media")
 
-    for module in (reports, detections, flight_plans, missions, telemetry, monitoring, dev):
+    for module in (reports, detections, flight_plans, missions, telemetry, monitoring, fleet, dev):
         app.include_router(module.router)
 
     @app.get("/health", tags=["health"])

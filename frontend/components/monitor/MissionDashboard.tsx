@@ -2,13 +2,17 @@
 
 // UC-M4 live dashboard for one mission (SCRUM-39, SCRUM-33) + UC-M5 camera card.
 // Telemetry every SIM.telemetryPollMs until done; the map shows the UAV (rotated by heading), the client-side
-// trail, the dashed plan with the next waypoint pulsing, target + survey circle, home + home line, camera cone.
+// trail, the dashed plan with the next waypoint highlighted, target + survey circle, home + home line, camera cone.
+// The map is the 3D digital twin (TwinMap), following the UAV from the start; without WebGL or the 3D style it
+// falls back to the flat Leaflet map.
 
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import MapView, { type CameraFootprint, type LatLng, type MapCircle, type MapPin, type MapUav } from "@/components/MapView";
 import StatusBadge from "@/components/StatusBadge";
+import type { TwinMission, TwinUav } from "@/components/ui/TwinMap";
 import {
   Banner,
   Button,
@@ -23,15 +27,22 @@ import {
   ProgressBar,
 } from "@/components/ui";
 import { ApiError, dispatchMission, getFlightPlan, getMission, getReport, listMissionDetections } from "@/lib/api";
-import { FLYING_STATES, MISSION_STATE, MONITOR, MONITOR_ROUTES } from "@/lib/config";
+import { DECISION_ACTION, FLYING_STATES, MAP, MISSION_STATE, MONITOR, MONITOR_ROUTES, SIM } from "@/lib/config";
 import { formatDateTime, formatPct } from "@/lib/format";
 import { usePoll } from "@/lib/hooks";
-import { routePoints, routeWaypoints } from "@/lib/map";
+import { DISTRICT_SERVICE_AREA, DISTRICT_STATIONS, routePoints, routeWaypoints } from "@/lib/map";
 
 import CameraCard from "./CameraCard";
 import DetectionRows from "./DetectionRows";
+import { useFleet } from "./fleet/FleetContext";
 import { FlightData, MissionStepper, SignalStatus, batteryLevel } from "./FlightStatus";
 import { useTelemetry, useTrail } from "./telemetry";
+
+// Client-only: maplibre-gl touches `window` at import time.
+const TwinMap = dynamic(() => import("@/components/ui/TwinMap"), {
+  ssr: false,
+  loading: () => <LoadingState className="absolute inset-0" text="Loading 3D map…" />,
+});
 
 const nullOn404 = (e: unknown) => {
   if (e instanceof ApiError && e.status === 404) return null;
@@ -59,8 +70,12 @@ export default function MissionDashboard({ missionId }: { missionId: number }) {
     }
   }, [final, refreshReport, refreshMission]);
 
-  const [follow, setFollow] = useState(false);
+  const [follow, setFollow] = useState(true); // watch the UAV fly from the start; dragging the map stops it
   const [fitN, setFitN] = useState(0);
+  const [flat, setFlat] = useState(false);
+  const [twinFailure, setTwinFailure] = useState<string | null>(null); // set: show the flat map instead
+  const twin = twinFailure === null;
+  const { data: fleet } = useFleet(); // district and base for the 3D map (config defaults until it answers)
   const [launching, setLaunching] = useState(false);
   const [launched, setLaunched] = useState(false); // hide "Launch UAV" until telemetry leaves "pending"
   const [launchError, setLaunchError] = useState<string | null>(null);
@@ -92,6 +107,48 @@ export default function MissionDashboard({ missionId }: { missionId: number }) {
     [telemetry, flying],
   );
   const highlight = flying && telemetry?.current_waypoint != null ? telemetry.current_waypoint : null;
+
+  // ---------------------------------------------------------------- the same layers on the 3D map
+  const district = useMemo(
+    () =>
+      fleet
+        ? { center: [fleet.district.center.lat, fleet.district.center.lon] as LatLng, radiusM: fleet.district.radius_m }
+        : { center: DISTRICT_SERVICE_AREA.center, radiusM: DISTRICT_SERVICE_AREA.radiusM },
+    [fleet],
+  );
+  const base: LatLng = fleet ? [fleet.base.lat, fleet.base.lon] : DISTRICT_STATIONS[0].position;
+  const batteryPct = telemetry?.battery_pct;
+  const twinUavs = useMemo<TwinUav[]>(
+    () =>
+      uav
+        ? [
+            {
+              id: droneId,
+              position: uav.position,
+              headingDeg: uav.headingDeg,
+              color: MAP.colors.uav,
+              label: batteryPct != null ? `${droneId} · ${Math.round(batteryPct)}%` : droneId,
+            },
+          ]
+        : [],
+    [uav, droneId, batteryPct],
+  );
+  const twinMission = useMemo<TwinMission>(
+    () => ({
+      uavId: droneId,
+      plannedRoute,
+      trail,
+      waypoints,
+      highlightWaypoint: highlight,
+      target,
+      surveyCircle: circle,
+      home,
+      homeLine: flying && !!home,
+      footprint,
+    }),
+    [droneId, plannedRoute, trail, waypoints, highlight, target, circle, home, flying, footprint],
+  );
+  const fitPoints = useMemo(() => [...(plannedRoute ?? []), ...(target ? [target] : [])], [plannedRoute, target]);
 
   const notFound = teleNotFound || (!missionQ.loading && !missionQ.error && mission === null);
 
@@ -148,22 +205,47 @@ export default function MissionDashboard({ missionId }: { missionId: number }) {
 
   return (
     <>
-      <MapView
-        plannedRoute={plannedRoute}
-        waypoints={waypoints}
-        highlightWaypoint={highlight}
-        trail={trail}
-        pin={pin}
-        circle={circle}
-        home={home}
-        homeLine={flying && !!home}
-        uav={uav}
-        cameraFootprint={footprint}
-        follow={follow}
-        onUserMove={() => setFollow(false)}
-        fitKey={plan && report ? `${missionId}-${fitN}` : null}
-      />
+      {twin ? (
+        <TwinMap
+          // The bounds are read once when the map is created, so a different district is a new map.
+          key={`${district.center[0]},${district.center[1]},${district.radiusM}`}
+          district={district}
+          base={base}
+          uavs={twinUavs}
+          pins={[]}
+          selectedUavId={uav ? droneId : null}
+          selectedPinId={null}
+          onUavClick={() => setFollow(true)}
+          onPinClick={() => undefined}
+          follow={follow && !!uav}
+          onUserMove={() => setFollow(false)}
+          resetKey={fitN}
+          fitPoints={fitPoints}
+          flat={flat}
+          avoidPanel
+          mission={twinMission}
+          glideMs={SIM.telemetryPollMs}
+          onFail={setTwinFailure}
+        />
+      ) : (
+        <MapView
+          plannedRoute={plannedRoute}
+          waypoints={waypoints}
+          highlightWaypoint={highlight}
+          trail={trail}
+          pin={pin}
+          circle={circle}
+          home={home}
+          homeLine={flying && !!home}
+          uav={uav}
+          cameraFootprint={footprint}
+          follow={follow}
+          onUserMove={() => setFollow(false)}
+          fitKey={plan && report ? `${missionId}-${fitN}` : null}
+        />
+      )}
       <MapControls>
+        {twin && <MapControlButton label={flat ? "3D view" : "2D view"} icon="map" active={flat} onClick={() => setFlat((f) => !f)} />}
         <MapControlButton label="Follow UAV" icon="locate" active={follow} disabled={!uav} onClick={() => setFollow((f) => !f)} />
         <MapControlButton
           label="Fit route"
@@ -225,13 +307,19 @@ export default function MissionDashboard({ missionId }: { missionId: number }) {
                 <SignalStatus telemetry={telemetry} failed={!!teleError} />
               </div>
               {state === "failed" && (
-                <Banner tone="danger" className="mt-3">
-                  Mission {MISSION_STATE.failed.label.toLowerCase()}.
+                // Recalled (weather, monitor) or aborted (edge, offline): say which and why, from the decision log.
+                <Banner
+                  tone="danger"
+                  title={mission?.end_action ? DECISION_ACTION[mission.end_action].label : `Mission ${MISSION_STATE.failed.label.toLowerCase()}`}
+                  className="mt-3"
+                >
+                  {mission?.end_reason ?? "The flight ended before the survey was finished."}
+                  {mission?.finished_at ? ` (${formatDateTime(mission.finished_at)})` : ""}
                 </Banner>
               )}
             </PanelSection>
 
-            {final && (
+            {final && state !== "failed" && (
               <PanelSection title="Result" action={result ? <StatusBadge status={result} kind="report" size="md" /> : undefined}>
                 {result === "confirmed" ? (
                   <Banner tone="success" title="Confirmed">

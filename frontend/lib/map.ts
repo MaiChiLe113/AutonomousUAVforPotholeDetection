@@ -251,3 +251,23 @@ export function formatDistance(m: number | null | undefined): string {
   if (m == null || Number.isNaN(m)) return "–";
   return m >= 1000 ? `${(m / 1000).toFixed(1)} km` : `${Math.round(m)} m`;
 }
+
+// ------------------------------------------------------------------ camera footprint geometry
+
+/** Camera cone from the UAV: apex at `from`, opening along `yawDeg`, length from pitch and altitude (Leaflet + 3D twin). */
+export function footprintPolygon(from: LatLng, yawDeg: number, pitchDeg?: number | null, altitudeM?: number | null): LatLng[] {
+  const cam = MAP.camera;
+  let range = cam.defaultRangeM;
+  if (pitchDeg != null && altitudeM != null && altitudeM > 0) {
+    const down = Math.abs(pitchDeg);
+    range = down >= 85 ? cam.minRangeM : altitudeM / Math.tan((Math.max(down, 5) * Math.PI) / 180);
+    range = Math.min(cam.maxRangeM, Math.max(cam.minRangeM, range));
+  }
+  const pts: LatLng[] = [from];
+  const steps = 8;
+  for (let i = 0; i <= steps; i++) {
+    const b = yawDeg - cam.halfAngleDeg + (2 * cam.halfAngleDeg * i) / steps;
+    pts.push(destinationPoint(from, b, range));
+  }
+  return pts;
+}

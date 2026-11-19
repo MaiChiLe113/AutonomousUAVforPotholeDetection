@@ -18,8 +18,9 @@ export interface ReportPhotoProps {
    * "tile": square that fills its parent's width (photo grid).
    * "full": parent-wide, whole photo visible (detail page).
    * "large": parent-wide on a dark backdrop, up to 60% of the screen height (photo large view).
+   * "banner": parent-wide strip, cropped (map popup card).
    */
-  variant?: "thumb" | "tile" | "full" | "large";
+  variant?: "thumb" | "tile" | "full" | "large" | "banner";
   size?: number;
   className?: string;
 }
@@ -33,12 +34,14 @@ export default function ReportPhoto({ path, alt, variant = "full", size = RESIDE
     tile: "aspect-square w-full bg-slate-100",
     full: "w-full rounded-xl border border-slate-200 bg-slate-50",
     large: "w-full bg-slate-900",
+    banner: "h-32 w-full bg-slate-100",
   }[variant];
   const fit = {
     thumb: "object-cover",
     tile: "object-cover",
     full: "max-h-64 object-contain",
     large: "max-h-[60dvh] object-contain",
+    banner: "object-cover",
   }[variant];
   const style = variant === "thumb" ? { width: size, height: size } : undefined;
 

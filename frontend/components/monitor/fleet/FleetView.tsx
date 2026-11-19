@@ -46,7 +46,7 @@ export default function FleetView() {
           <FleetHeader fleet={fleet} />
           <section aria-label="UAVs" className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {fleet.drones.map((d) => (
-              <UavCard key={d.drone_id} drone={d} onRecall={actions.askRecall} />
+              <UavCard key={d.drone_id} drone={d} onRecall={actions.askRecall} base={[fleet.base.lat, fleet.base.lon]} />
             ))}
           </section>
           <section aria-label="Inspection queue" className="space-y-2">

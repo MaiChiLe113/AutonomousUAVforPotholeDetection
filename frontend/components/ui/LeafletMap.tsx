@@ -20,7 +20,7 @@ import {
 } from "react-leaflet";
 
 import { MAP } from "@/lib/config";
-import { destinationPoint, normalizeDeg, type FlyTarget, type LatLng, type MapBounds, type MapViewProps } from "@/lib/map";
+import { destinationPoint, footprintPolygon, normalizeDeg, type FlyTarget, type LatLng, type MapBounds, type MapViewProps } from "@/lib/map";
 
 // ------------------------------------------------------------------ icons (divIcon, no CDN images)
 
@@ -250,25 +250,6 @@ function MapBehaviour({ onMapClick, onUserMove, onReady, flyTo, follow, uavPos, 
   }, [fitKey, map]);
 
   return null;
-}
-
-// ------------------------------------------------------------------ camera footprint geometry
-
-function footprintPolygon(from: LatLng, yawDeg: number, pitchDeg?: number | null, altitudeM?: number | null): LatLng[] {
-  const cam = MAP.camera;
-  let range = cam.defaultRangeM;
-  if (pitchDeg != null && altitudeM != null && altitudeM > 0) {
-    const down = Math.abs(pitchDeg);
-    range = down >= 85 ? cam.minRangeM : altitudeM / Math.tan((Math.max(down, 5) * Math.PI) / 180);
-    range = Math.min(cam.maxRangeM, Math.max(cam.minRangeM, range));
-  }
-  const pts: LatLng[] = [from];
-  const steps = 8;
-  for (let i = 0; i <= steps; i++) {
-    const b = yawDeg - cam.halfAngleDeg + (2 * cam.halfAngleDeg * i) / steps;
-    pts.push(destinationPoint(from, b, range));
-  }
-  return pts;
 }
 
 // ------------------------------------------------------------------ component

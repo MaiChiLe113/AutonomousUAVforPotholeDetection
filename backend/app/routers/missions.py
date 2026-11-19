@@ -49,6 +49,7 @@ from app.schemas import (
 )
 from app.services.dispatcher import dispatch_tick, recall_mission
 from app.services.fleet import DroneStatus, MissionStart, get_drone_state, get_mission_start, record_mission_start
+from app.services.safety import list_decisions
 from config import MOCK, UAV
 from sim.mock_flight import telemetry_at
 
@@ -63,21 +64,36 @@ def _mission(db: Session, mission_id: int) -> Mission:
     return sync_mission(db, get_or_404(db, Mission, mission_id, "Mission"))
 
 
+def _mission_out(db: Session, mission: Mission) -> MissionOut:
+    """MissionOut plus, for a failed mission, the recall / abort decision logged when it ended."""
+    out = MissionOut.model_validate(mission)
+    if mission.state != MissionState.failed or mission.finished_at is None:
+        return out
+    for d in list_decisions(db):  # newest first; every failure path logs its decision at finished_at
+        if (
+            d.report_id == mission.report_id
+            and d.action in ("recall", "abort")
+            and abs(seconds_between(d.at, mission.finished_at)) < 1.0
+        ):
+            return out.model_copy(update={"end_action": d.action, "end_reason": d.reason})
+    return out
+
+
 @router.get("", response_model=list[MissionOut])
-def list_missions(active: bool = False, db: Session = Depends(get_db)) -> list[Mission]:
+def list_missions(active: bool = False, db: Session = Depends(get_db)) -> list[MissionOut]:
     """Newest first. active=true: pending, takeoff, surveying or landing. SCRUM-39."""
     sync_active_missions(db)
     dispatch_tick(db)
     query = select(Mission).order_by(Mission.id.desc())
     if active:
         query = query.where(Mission.state.in_(_ACTIVE))
-    return list(db.scalars(query).all())
+    return [_mission_out(db, m) for m in db.scalars(query).all()]
 
 
 @router.get("/{mission_id}", response_model=MissionOut)
-def get_mission(mission_id: int, db: Session = Depends(get_db)) -> Mission:
-    """One mission with its current state. SCRUM-39."""
-    return _mission(db, mission_id)
+def get_mission(mission_id: int, db: Session = Depends(get_db)) -> MissionOut:
+    """One mission with its current state (and how it ended, when it failed). SCRUM-39."""
+    return _mission_out(db, _mission(db, mission_id))
 
 
 @router.post("/{mission_id}/dispatch", response_model=MissionOut, dependencies=[Depends(require_monitor)])
@@ -138,7 +154,9 @@ def current_telemetry(db: Session, mission: Mission) -> UavTelemetry:
     - Flying: a posted/ingested sample younger than MOCK.ingest_hold_s wins; otherwise a new simulated
       sample is stored at most every UAV.telemetry_interval_s.
     - Done: the final landed sample (stamped at finished_at).
-    - Pending / failed: the UAV parked at home (in_mission false).
+    - Failed (recalled / aborted): one final "failed" sample where the mission ended (stamped at finished_at,
+      in_mission false), so a dashboard sees the end instead of the last in-flight sample going stale.
+    - Pending: the UAV parked at home (in_mission false).
     """
     now = now_utc()
     dispatch_tick(db, now)
@@ -149,8 +167,8 @@ def current_telemetry(db: Session, mission: Mission) -> UavTelemetry:
         .order_by(UavTelemetry.ts.desc(), UavTelemetry.id.desc())
         .limit(1)
     )
-    if mission.state == MissionState.done:
-        query = query.where(UavTelemetry.state == MissionState.done)
+    if mission.state in (MissionState.done, MissionState.failed):
+        query = query.where(UavTelemetry.state == mission.state)
     newest = db.scalars(query).first()
 
     if mission.state in FLYING_STATES:
@@ -167,6 +185,14 @@ def current_telemetry(db: Session, mission: Mission) -> UavTelemetry:
             return newest
         sample = _mission_sample(db, mission, mission_duration_s(mission))
         return store_sample(db, mission, sample, "sim", mission.finished_at or now)
+
+    if mission.state == MissionState.failed:
+        if newest is not None:
+            return newest
+        ended_at = mission.finished_at or now
+        sample = _mission_sample(db, mission, mission_elapsed_s(mission, ended_at))  # where it was recalled
+        sample.update(state=MissionState.failed, in_mission=False)
+        return store_sample(db, mission, sample, "sim", ended_at)
 
     if newest is not None:
         return newest
@@ -201,10 +227,10 @@ def recall_flying_mission(
     mission_id: int,
     body: PlanDecision | None = None,
     db: Session = Depends(get_db),
-) -> Mission:
+) -> MissionOut:
     """Monitor override: recall a flying drone, return it to base, and requeue the task."""
     reason = body.reason if body is not None else "Recalled by monitor"
-    return recall_mission(db, mission_id, reason=reason)
+    return _mission_out(db, recall_mission(db, mission_id, reason=reason))
 
 
 @router.get("/{mission_id}/detections", response_model=list[DetectionOut])

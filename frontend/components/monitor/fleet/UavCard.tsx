@@ -1,7 +1,9 @@
 "use client";
 
-// One UAV of the fleet: status, battery, swap countdown, mission / target and the last go / no-go decision.
+// One UAV of the fleet: status, live mini map (Fleet tab), battery, swap countdown, mission / target and the last
+// go / no-go decision.
 
+import type { LatLng } from "@/components/MapView";
 import StatusBadge from "@/components/StatusBadge";
 import { batteryLevel } from "@/components/monitor/FlightStatus";
 import { ButtonLink, Button, Icon, ProgressBar } from "@/components/ui";
@@ -11,6 +13,8 @@ import { countdownTo, formatPct, timeAgo } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
 import type { Drone } from "@/lib/types";
 
+import UavMiniMap from "./UavMiniMap";
+
 export interface UavCardProps {
   drone: Drone;
   /** Recall a flying UAV (opens the reason dialog). Hidden when omitted. */
@@ -19,12 +23,14 @@ export interface UavCardProps {
   framed?: boolean;
   selected?: boolean;
   onSelect?: () => void;
+  /** The UAV base. When set, a framed card shows a live mini map that opens the Digital twin on this UAV. */
+  base?: LatLng;
   className?: string;
 }
 
 const fmtCoord = (n: number) => n.toFixed(4);
 
-export default function UavCard({ drone, onRecall, framed = true, selected = false, onSelect, className }: UavCardProps) {
+export default function UavCard({ drone, onRecall, framed = true, selected = false, onSelect, base, className }: UavCardProps) {
   const now = useNow(MONITOR.countdownClockMs);
   const level = batteryLevel(drone.battery_pct);
   const color = level ? BATTERY.colors[level] : undefined;
@@ -58,6 +64,8 @@ export default function UavCard({ drone, onRecall, framed = true, selected = fal
         </div>
         <StatusBadge status={drone.status} kind="drone" />
       </header>
+
+      {framed && base && <UavMiniMap drone={drone} base={base} />}
 
       <div>
         <ProgressBar label="Battery" value={drone.battery_pct} color={color} valueText={formatPct(drone.battery_pct)} />

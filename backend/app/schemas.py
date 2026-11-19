@@ -98,6 +98,10 @@ class MissionOut(_Orm):
     state: MissionState
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    # How a failed mission ended (from the go / no-go decision log): recalled (weather, monitor) or aborted
+    # (edge failure, drone offline). Both null unless the state is failed.
+    end_action: Literal["recall", "abort"] | None = None
+    end_reason: str | None = None
 
 
 class TelemetryIn(BaseModel):

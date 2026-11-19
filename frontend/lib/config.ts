@@ -47,6 +47,8 @@ export const MONITOR_ROUTES = {
   dashboard: (missionId?: number | string | null) =>
     missionId == null ? "/monitor/dashboard" : `/monitor/dashboard?mission=${missionId}`,
   dashboardMap: "/monitor/dashboard/map",
+  /** Digital twin selected on one UAV and following it (the UAV card mini map links here). */
+  dashboardDrone: (droneId: string) => `/monitor/dashboard/map/${encodeURIComponent(droneId)}`,
   dashboardHistory: "/monitor/dashboard/history",
 };
 
@@ -114,9 +116,11 @@ export const RESIDENT = {
 // ---------------------------------------------------------------- monitor pages
 export const MONITOR = {
   fleetPollMs: 2000, // GET /fleet on every dashboard tab (cards, map, decision log)
+  twinReportsPollMs: 5000, // Digital twin: GET /reports for the report dots
   historyPollMs: 5000, // History tab: finished missions
   historyMaxMissions: 25, // History tab: newest finished missions listed
   countdownClockMs: 1000, // "ready in 42 s" on a swapping UAV card
+  uavMiniMapZoom: 15, // UAV card mini map: street level around the UAV
   decisionsShown: 50, // History tab: newest decisions listed
   /**
    * Monitor sidebar tabs. A tab is active on its own href or on a route under one of `alsoUnder`.
@@ -124,7 +128,7 @@ export const MONITOR = {
    */
   tabs: [
     { key: "fleet", label: "Fleet", icon: "drone", href: "/monitor/dashboard", alsoUnder: [] },
-    { key: "map", label: "Digital twin", icon: "map", href: "/monitor/dashboard/map", alsoUnder: [] },
+    { key: "map", label: "Digital twin", icon: "map", href: "/monitor/dashboard/map", alsoUnder: ["/monitor/dashboard/map"] },
     { key: "reports", label: "Reports", icon: "list", href: "/monitor", alsoUnder: ["/monitor/reports", "/monitor/flight-plans"] },
     { key: "simulator", label: "Simulator", icon: "play", href: "/monitor/dashboard/simulator", alsoUnder: [] },
     { key: "history", label: "History", icon: "history", href: "/monitor/dashboard/history", alsoUnder: [] },
@@ -237,9 +241,23 @@ export const TWIN = {
   loadTimeoutMs: 15000, // style not loaded by then: fall back to the flat Leaflet map
   // District ring
   ring: { color: "#2563eb", width: 2, dash: [3, 2], fillOpacity: 0.06, segments: 96 },
-  // Report / task pins
-  pin: { radius: 7, strokeColor: "#ffffff", strokeWidth: 2, hitRadius: 12 },
-  pinStatuses: ["queued", "held", "flagged", "dispatched"] as TaskStatus[], // tasks drawn as pins
+  // Report dots (every report, coloured by REPORT_STATUS; a click opens the popup card)
+  pin: { radius: 8, strokeColor: "#ffffff", strokeWidth: 2, hitRadius: 14 },
+  popup: { offsetPx: 14, widthPx: 264 },
+  // Live mission view layers (colours: MAP.colors, the same as the flat map)
+  mission: {
+    routeWidth: 4,
+    routeDash: [2, 2],
+    trailWidth: 3,
+    homeLineDash: [2, 3],
+    surveyFillOpacity: 0.08,
+    coneFillOpacity: 0.22,
+    waypointRadius: 4, // fly / survey points
+    endpointRadius: 6, // takeoff / land
+    highlightRadius: 8, // the waypoint the UAV is heading to
+    targetRadius: 8, // the pothole
+    fitMaxZoom: 17, // "Fit route" never zooms in further than this
+  },
   // Extrusion layer added only when the style has none
   extrusion: {
     color: "#dfe3e8",
@@ -256,6 +274,9 @@ export const TWIN = {
   // HTML markers
   uavSizePx: 40,
   baseSizePx: 26,
+  // UAVs parked on the same spot (the base) are drawn side by side, lifted above the base marker
+  stackSpreadPx: 112, // wide enough for the "sim-uav-1 · 100%" labels
+  stackLiftPx: 34,
 };
 
 // ---------------------------------------------------------------- statuses

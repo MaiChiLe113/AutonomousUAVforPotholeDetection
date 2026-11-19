@@ -95,6 +95,9 @@ export interface Mission {
   state: MissionState;
   started_at: string | null;
   finished_at: string | null;
+  /** How a failed mission ended (go / no-go decision log): recalled (weather, monitor) or aborted (edge, offline). */
+  end_action: "recall" | "abort" | null;
+  end_reason: string | null; // e.g. "sim-uav-1 recalled: Recalled by the drone: Rain started"
 }
 
 /** Body of POST /missions/{id}/telemetry (internal snake_case names). */

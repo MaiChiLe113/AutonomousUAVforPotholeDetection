@@ -206,7 +206,9 @@ body {
 /* ------------------------------------------------------------------ 3D digital twin (MapLibre markers) */
 
 .twin-uav {
-  position: relative;
+  /* absolute, like maplibre's own .maplibregl-marker: "relative" here would win when this sheet loads after
+     maplibre-gl.css and drop the marker into the page flow below the map canvas. Still the label's anchor. */
+  position: absolute;
   cursor: pointer;
   --twin-uav-color: var(--color-accent);
 }
@@ -302,4 +304,23 @@ body {
 
 .animate-sheet-in {
   animation: sheet-in 160ms ease-out;
+}
+
+/* Report popup card on the 3D twin (maplibre Popup): white rounded card, photo flush to the edges. */
+.twin-popup .maplibregl-popup-content {
+  padding: 0;
+  overflow: hidden;
+  border-radius: 1rem;
+  box-shadow: 0 10px 30px rgb(15 23 42 / 0.25);
+}
+
+.twin-popup .maplibregl-popup-close-button {
+  top: 6px;
+  right: 6px;
+  width: 28px;
+  height: 28px;
+  border-radius: 9999px;
+  background: rgb(255 255 255 / 0.9);
+  font-size: 18px;
+  line-height: 1;
 }

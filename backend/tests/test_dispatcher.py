@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.db import Base
 from app.main import create_app
 from app.models import FlightPlan, Mission, MissionState, PlanStatus, Report, ReportStatus
+from app.routers.common import sync_mission
 from app.services.dispatcher import (
     TaskStatus,
     cancel_task,
@@ -349,3 +350,58 @@ def test_s10_drone_goes_offline_excluded_and_active_task_requeued(db_session: Se
 def _utc(dt: datetime | None) -> datetime:
     assert dt is not None
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def test_task_completed_when_a_read_finishes_the_mission_before_the_tick(db_session: Session):
+    """GET /fleet, /reports and /missions run sync_mission, which can finish a mission before the dispatcher
+    tick sees it. The next tick must still close the task, or it stays "dispatched" forever."""
+    t0 = datetime(2026, 11, 16, 10, 0, tzinfo=UTC)
+    r = _add_report(db_session, 10.7800, 106.7030, created_at=t0)
+    task = enqueue_report(db_session, r, now=t0)
+    assert task.status == TaskStatus.dispatched
+    mission = db_session.get(Mission, task.mission_id)
+    assert mission is not None
+
+    later = t0 + timedelta(hours=2)
+    sync_mission(db_session, mission, later)  # a read finishes the flight first
+    assert mission.state == MissionState.done
+    assert get_task(db_session, task.task_id).status == TaskStatus.dispatched
+
+    dispatch_tick(db_session, now=later)
+
+    closed = get_task(db_session, task.task_id)
+    assert closed.status == TaskStatus.completed
+    db_session.refresh(r)
+    assert r.status in (ReportStatus.confirmed, ReportStatus.not_confirmed)
+
+
+def test_recalled_mission_reports_failed_telemetry_and_reason():
+    """After a mid-flight recall the latest telemetry says "failed" (not the stale in-flight sample, which made
+    the live dashboard show "Signal lost"), and the mission says it was recalled and why."""
+    with TestClient(create_app(), headers=MONITOR_HEADERS) as client:
+        assert client.post("/dev/reset").status_code == 200
+        with (_MEDIA / "pothole-1.jpg").open("rb") as photo:
+            res = client.post(
+                "/reports", data={"lat": "10.7720", "lon": "106.7050"}, files={"photo": ("p.jpg", photo, "image/jpeg")}
+            )
+        assert res.status_code == 201
+        enq = client.post(f"/reports/{res.json()['id']}/enqueue").json()
+        assert enq["status"] == "dispatched"
+        mission_id = enq["mission_id"]
+
+        in_flight = client.get(f"/missions/{mission_id}/telemetry/latest").json()
+        assert in_flight["state"] in ("takeoff", "surveying", "landing")
+        assert client.get(f"/missions/{mission_id}").json()["end_action"] is None
+
+        recall = client.post(f"/missions/{mission_id}/recall", json={"reason": "Airspace conflict"})
+        assert recall.status_code == 200
+        assert recall.json()["end_action"] == "recall"
+
+        latest = client.get(f"/missions/{mission_id}/telemetry/latest").json()
+        assert latest["state"] == "failed"
+        assert latest["in_mission"] is False
+
+        mission = client.get(f"/missions/{mission_id}").json()
+        assert mission["state"] == "failed"
+        assert mission["end_action"] == "recall"
+        assert "Airspace conflict" in mission["end_reason"]

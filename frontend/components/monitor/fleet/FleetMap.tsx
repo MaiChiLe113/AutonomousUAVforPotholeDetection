@@ -1,22 +1,27 @@
 "use client";
 
 // Digital twin tab (/monitor/dashboard/map): the district in 3D (MapLibre, extruded OSM buildings) with the base,
-// the 2 km service ring, every UAV and the queued report pins, all from GET /fleet.
-// Selecting a UAV (marker) or a report pin opens it in a FloatingPanel. Controls: Reset view, 2D / 3D, Follow UAV.
+// the 2 km service ring and every UAV (GET /fleet), and every report as a dot coloured by status (GET /reports).
+// /monitor/dashboard/map/<droneId> (the UAV card mini map links here) selects that UAV and follows it.
+// A UAV (marker) opens in a FloatingPanel; a report dot opens a popup card above it (ReportPopupCard).
+// Controls: Reset view, 2D / 3D, Follow UAV.
 // If WebGL or the 3D style is unavailable it falls back to the flat Leaflet map (Fit district, Follow UAV).
 
 import dynamic from "next/dynamic";
+import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 
 import MapView, { type LatLng, type MapFleetUav } from "@/components/MapView";
-import StatusBadge from "@/components/StatusBadge";
-import { Banner, ButtonLink, Chip, FloatingPanel, LoadingState, MapControlButton, MapControls } from "@/components/ui";
+import { Banner, Chip, FloatingPanel, LoadingState, MapControlButton, MapControls } from "@/components/ui";
 import type { TwinPin, TwinUav } from "@/components/ui/TwinMap";
-import { DRONE_STATUS, MAP, MONITOR_ROUTES, TASK_STATUS, TWIN } from "@/lib/config";
+import { listReports } from "@/lib/api";
+import { DRONE_STATUS, MAP, MONITOR, MONITOR_ROUTES, REPORT_STATUS, TWIN } from "@/lib/config";
+import { usePoll } from "@/lib/hooks";
 import { circleBounds, DISTRICT_SERVICE_AREA, DISTRICT_VIEW, type MapServiceArea, type MapStation } from "@/lib/map";
 import type { Drone } from "@/lib/types";
 
 import { useFleet } from "./FleetContext";
+import ReportPopupCard from "./ReportPopupCard";
 import UavCard from "./UavCard";
 import { useFleetActions } from "./useFleetActions";
 
@@ -26,11 +31,13 @@ const TwinMap = dynamic(() => import("@/components/ui/TwinMap"), {
   loading: () => <LoadingState className="absolute inset-0" text="Loading 3D map…" />,
 });
 
-export default function FleetMap() {
+/** `droneId` (from the URL) is the selected UAV; selecting another one changes the URL. */
+export default function FleetMap({ droneId = null }: { droneId?: string | null }) {
   const { data: fleet, error, loading, refresh } = useFleet();
   const actions = useFleetActions(refresh);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [follow, setFollow] = useState(false);
+  const router = useRouter();
+  const selectedId = droneId;
+  const [follow, setFollow] = useState(droneId !== null); // opened on a UAV: watch it fly
   const [fitN, setFitN] = useState(0);
   const [selectedPinId, setSelectedPinId] = useState<string | null>(null);
   const [flat, setFlat] = useState(false);
@@ -73,22 +80,22 @@ export default function FleetMap() {
       })),
     [fleet],
   );
+  const { data: reports } = usePoll(() => listReports(), MONITOR.twinReportsPollMs);
   const twinPins = useMemo<TwinPin[]>(
-    () =>
-      (fleet?.queue ?? [])
-        .filter((t) => TWIN.pinStatuses.includes(t.status))
-        .map((t) => ({ id: String(t.task_id), position: [t.lat, t.lon] as LatLng, color: TASK_STATUS[t.status].color })),
-    [fleet],
+    () => (reports ?? []).map((r) => ({ id: String(r.id), position: [r.lat, r.lon] as LatLng, color: REPORT_STATUS[r.status].color })),
+    [reports],
   );
 
   const selected: Drone | null = fleet?.drones.find((d) => d.drone_id === selectedId) ?? null;
-  const selectedTask = fleet?.queue.find((t) => String(t.task_id) === selectedPinId) ?? null;
+  const selectedReport = reports?.find((r) => String(r.id) === selectedPinId) ?? null;
+  const selectedReportTask = selectedReport ? (fleet?.queue.find((t) => t.report_id === selectedReport.id) ?? null) : null;
   const twin = twinFailure === null;
 
+  // Picking a UAV follows it, so its flight can be watched straight away; dragging the map stops following.
   const selectUav = (id: string | null) => {
-    setSelectedId(id);
     setSelectedPinId(null);
-    if (id === null) setFollow(false);
+    setFollow(id !== null);
+    if (id !== selectedId) router.push(id === null ? MONITOR_ROUTES.dashboardMap : MONITOR_ROUTES.dashboardDrone(id));
   };
 
   if (loading && !fleet && !error) return <LoadingState className="absolute inset-0" text="Loading fleet…" />;
@@ -108,14 +115,24 @@ export default function FleetMap() {
           onUavClick={selectUav}
           onPinClick={(id) => {
             setSelectedPinId(id);
-            setSelectedId(null);
             setFollow(false);
+            if (selectedId !== null) router.push(MONITOR_ROUTES.dashboardMap);
           }}
           follow={follow && !!selected}
           onUserMove={() => setFollow(false)}
           resetKey={fitN}
           flat={flat}
-          avoidPanel={!!selected || !!selectedTask}
+          avoidPanel={!!selected}
+          popup={
+            selectedReport
+              ? {
+                  id: String(selectedReport.id),
+                  position: [selectedReport.lat, selectedReport.lon],
+                  content: <ReportPopupCard report={selectedReport} task={selectedReportTask} />,
+                }
+              : null
+          }
+          onPopupClose={() => setSelectedPinId(null)}
           onFail={setTwinFailure}
         />
       ) : (
@@ -169,6 +186,11 @@ export default function FleetMap() {
           <Banner tone="danger">{error}</Banner>
         </div>
       )}
+      {fleet && droneId !== null && !selected && (
+        <div className="absolute top-3 left-3 z-10 max-w-[calc(100%-11rem)] md:max-w-sm">
+          <Banner tone="warning">UAV &quot;{droneId}&quot; is not in this fleet.</Banner>
+        </div>
+      )}
 
       {selected && (
         <FloatingPanel
@@ -177,28 +199,6 @@ export default function FleetMap() {
           onBack={() => selectUav(null)}
         >
           <UavCard drone={selected} framed={false} onRecall={actions.askRecall} />
-        </FloatingPanel>
-      )}
-      {selectedTask && (
-        <FloatingPanel
-          title={`Report #${selectedTask.report_id}`}
-          subtitle="Inspection task"
-          headerRight={<StatusBadge status={selectedTask.status} kind="task" />}
-          onBack={() => setSelectedPinId(null)}
-          footer={
-            <ButtonLink fullWidth variant="secondary" href={MONITOR_ROUTES.report(selectedTask.report_id)}>
-              Open report
-            </ButtonLink>
-          }
-        >
-          <p className="text-sm text-slate-700">Priority {selectedTask.priority}</p>
-          {selectedTask.hold_reason ? (
-            <Banner tone="warning" title="Held" className="mt-2">
-              {selectedTask.hold_reason}
-            </Banner>
-          ) : (
-            <p className="mt-1 text-sm text-slate-500">No hold reason: a UAV takes it as soon as one is cleared to fly.</p>
-          )}
         </FloatingPanel>
       )}
       {actions.dialog}

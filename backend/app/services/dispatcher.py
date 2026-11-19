@@ -663,6 +663,23 @@ def _allocate_at(
     return dispatched
 
 
+def _complete_tasks_of_finished_missions(db: Session) -> None:
+    """Close dispatched tasks whose mission is already done.
+
+    The tick loop below closes a task when it finishes the mission itself, but reads (GET /fleet, /reports,
+    /missions via sync_mission) and POST /missions/{id}/results can finish a mission first; the loop then
+    never sees it as flying and the task would stay "dispatched" forever."""
+    for task in list_tasks(db, TaskStatus.dispatched):
+        if task.mission_id is None:
+            continue
+        mission = db.get(Mission, task.mission_id)
+        if mission is None or mission.state != MissionState.done:
+            continue
+        task.status = TaskStatus.completed
+        save_task(db, task)
+        _sync_task_report_statuses(db, task, mission.report.status)
+
+
 def dispatch_tick(
     db: Session,
     now: datetime | None = None,
@@ -694,6 +711,7 @@ def _dispatch_tick(
     t_now = _utc(now or now_utc())
     dispatched: list[Mission] = []
 
+    _complete_tasks_of_finished_missions(db)
     _handle_offline_flying_missions(db, t_now, fleet_cfg, energy_cfg)
     if weather_check:
         mid_flight_check(db, t_now, fleet_cfg=fleet_cfg, energy_cfg=energy_cfg)
